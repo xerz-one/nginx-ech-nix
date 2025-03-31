@@ -26,6 +26,12 @@
           patches = prev.patches ++ filesystem.listFilesRecursive ./patches/nginx;
         });
 
+        nginxQuic = (pkgs.nginxQuic.override {
+          openssl = final.openssl;
+        }).overrideAttrs (final: prev: {
+          patches = prev.patches ++ filesystem.listFilesRecursive ./patches/nginx;
+        });
+
         default = final.nginx;
       }
     );
