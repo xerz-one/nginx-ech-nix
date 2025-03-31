@@ -1,0 +1,789 @@
+From 7dbac38b36a6dbe0a41e836b34b4332065ebc710 Mon Sep 17 00:00:00 2001
+From: sftcd <stephen.farrell@cs.tcd.ie>
+Date: Wed, 2 Oct 2024 16:42:21 +0100
+Subject: [PATCH 1/3] ECH changes collected
+
+---
+ src/event/ngx_event_openssl.c              | 236 ++++++++++++++++++++-
+ src/event/ngx_event_openssl.h              |  14 ++
+ src/http/modules/ngx_http_ssl_module.c     |  30 ++-
+ src/http/modules/ngx_http_ssl_module.h     |   4 +-
+ src/stream/ngx_stream_proxy_module.c       |  28 +++
+ src/stream/ngx_stream_ssl_preread_module.c | 184 +++++++++++++++-
+ src/stream/ngx_stream_ssl_preread_module.h |  46 ++++
+ 7 files changed, 536 insertions(+), 6 deletions(-)
+ create mode 100644 src/stream/ngx_stream_ssl_preread_module.h
+
+diff --git a/src/event/ngx_event_openssl.c b/src/event/ngx_event_openssl.c
+index 35e9f3c88..2cab231b6 100644
+--- a/src/event/ngx_event_openssl.c
++++ b/src/event/ngx_event_openssl.c
+@@ -9,6 +9,13 @@
+ #include <ngx_core.h>
+ #include <ngx_event.h>
+ 
++#ifndef OPENSSL_NO_ECH
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <dirent.h>
++#include <openssl/ech.h>
++#endif
++
+ 
+ #define NGX_SSL_PASSWORD_BUFFER_SIZE  4096
+ 
+@@ -272,7 +279,6 @@ ngx_ssl_init(ngx_log_t *log)
+     return NGX_OK;
+ }
+ 
+-
+ ngx_int_t
+ ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
+ {
+@@ -1040,7 +1046,36 @@ ngx_ssl_info_callback(const ngx_ssl_conn_t *ssl_conn, int where, int ret)
+             }
+         }
+     }
++#endif
+ 
++#ifndef OPENSSL_NO_ECH
++    if ((where & SSL_CB_HANDSHAKE_DONE) == SSL_CB_HANDSHAKE_DONE) {
++        c = ngx_ssl_get_connection((ngx_ssl_conn_t *) ssl_conn);
++
++        char *inner_sni = NULL;
++        char *outer_sni = NULL;
++        int echrv = SSL_ech_get_status(c->ssl->connection, &inner_sni,
++                                       &outer_sni);
++        switch (echrv) {
++        case SSL_ECH_STATUS_NOT_TRIED:
++            ngx_ssl_error(NGX_LOG_INFO, c->log, 0, "ECH not attempted");
++            break;
++        case SSL_ECH_STATUS_FAILED:
++            ngx_ssl_error(NGX_LOG_ERR, c->log, 0, "ECH tried but failed");
++            break;
++        case SSL_ECH_STATUS_BAD_NAME:
++            ngx_ssl_error(NGX_LOG_ERR, c->log, 0, "ECH worked but bad name");
++            break;
++        case SSL_ECH_STATUS_SUCCESS:
++            ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0,
++                    "ECH success outer_sni: %s inner_sni: %s",
++                    (outer_sni?outer_sni:"NONE"),(inner_sni?inner_sni:"NONE"));
++            break;
++        default:
++            ngx_ssl_error(NGX_LOG_ERR, c->log, 0, "Error getting ECH status");
++            break;
++        }
++    }
+ #endif
+ 
+     if ((where & SSL_CB_ACCEPT_LOOP) == SSL_CB_ACCEPT_LOOP) {
+@@ -1285,6 +1320,129 @@ ngx_ssl_passwords_cleanup(void *data)
+     }
+ }
+ 
++#ifndef OPENSSL_NO_ECH
++
++/* 
++ * load any key files called <name>.ech we find in the ssl_echkeydir 
++ * directory 
++ */
++static int load_echkeys(ngx_ssl_t *ssl, ngx_str_t *dirname)
++{
++    /*
++     * Try load any good looking public/private ECH values found in files
++     * in that directory
++     *
++     * This code is derived from what I added to openssl s_server, (and
++     * then lighttpd)
++     *
++     */
++    ngx_dir_t thedir;
++    ngx_int_t nrv = ngx_open_dir(dirname, &thedir);
++    char privname[PATH_MAX];
++    int somekeyworked = 0;
++    /*
++     * I really can't see a reason to want >1024 private key files
++     * to have to be checked in a directory, but if there were a
++     * reason then you could change this I guess or make it a 
++     * config setting.
++     */
++    int maxkeyfiles=1024;
++    size_t elen=dirname->len;
++    char *den = NULL, *last4 = NULL;
++    size_t nlen = 0;
++    struct stat thestat;
++    int numkeys = 0;
++
++    if (nrv != NGX_OK) {
++        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
++            "load_echkeys, error opening %s at %d", dirname->data, __LINE__);
++        return NGX_ERROR;
++    }
++    for (;;) {
++        nrv=ngx_read_dir(&thedir);
++        if (nrv!=NGX_OK) {
++            break;
++        }
++        den = (char *)ngx_de_name(&thedir);
++        nlen = strlen(den);
++        if (nlen > 4) {
++            last4 = den + nlen - 4;
++            if (strncmp(last4, ".ech", 4)) {
++                continue;
++            }
++            if ((elen + 1 + nlen + 1) >= PATH_MAX) {
++                ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
++                    "load_echkeys, error, name too long: %s with %s",
++                    dirname->data, den);
++                continue;
++            }
++            snprintf(privname, PATH_MAX,"%s/%s", dirname->data, den);
++            if (!--maxkeyfiles) {
++                // just so we don't loop forever, ever
++                ngx_ssl_error(NGX_LOG_ALERT, ssl->log, 0,
++                    "load_echkeys, too many private key files to check!");
++                ngx_ssl_error(NGX_LOG_ALERT, ssl->log, 0,
++                    "load_echkeys, maxkeyfiles is hardcoded to 1024, fix if you like!");
++                 return NGX_ERROR;
++            }
++            if (stat(privname, &thestat) == 0) {
++                    if (SSL_CTX_ech_server_enable_file(ssl->ctx, privname,
++                        SSL_ECH_USE_FOR_RETRY) != 1) {
++                    ngx_ssl_error(NGX_LOG_ALERT, ssl->log, 0,
++                        "load_echkeys, failed for: %s",privname);
++                } else {
++                    ngx_ssl_error(NGX_LOG_NOTICE, ssl->log, 0,
++                        "load_echkeys, worked for: %s", privname);
++                    somekeyworked = 1;
++                }
++            }
++        }
++    }
++    ngx_close_dir(&thedir);
++
++    if (somekeyworked == 0) {
++        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, 
++            "load_echkeys failed for all keys but ECH configured");
++        return NGX_ERROR;
++    }
++
++    if (SSL_CTX_ech_server_get_key_status(ssl->ctx, &numkeys) != 1) {
++        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, 
++            "load_echkeys SSL_CTX_ech_server_key_status failed");
++        return NGX_ERROR;
++    }
++    ngx_ssl_error(NGX_LOG_NOTICE, ssl->log, 0, 
++            "load_echkeys, total keys loaded: %d", numkeys);
++
++    return NGX_OK;
++}
++
++ngx_int_t
++ngx_ssl_echkeydir(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *dir)
++{
++    int rv = 0;
++
++    if (!dir) {
++        return NGX_OK;
++    }
++    if (dir->len == 0) {
++        return NGX_OK;
++    }
++    if (cf != NULL && ngx_conf_full_name(cf->cycle, dir, 1) != NGX_OK) {
++        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, 
++                "Hey some bad ech stuff happened at %d",__LINE__);
++        return NGX_ERROR;
++    }
++    rv = load_echkeys(ssl, dir);
++    if (rv!=NGX_OK) {
++        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, 
++                "Hey some bad ech stuff happened at %d",__LINE__);
++        return rv;
++    }
++    return NGX_OK;
++}
++
++#endif
+ 
+ ngx_int_t
+ ngx_ssl_dhparam(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *file)
+@@ -3553,7 +3711,11 @@ ngx_ssl_error(ngx_uint_t level, ngx_log_t *log, ngx_err_t err, char *fmt, ...)
+ 
+         for ( ;; ) {
+ 
+-            n = ERR_peek_error_data(&data, &flags);
++#ifndef OPENSSL_NO_ECH
++            n = ERR_peek_last_error_data(&data, &flags);
++#else
++            n = ERR_peek_error_line_data(NULL, NULL, &data, &flags);
++#endif
+ 
+             if (n == 0) {
+                 break;
+@@ -4926,6 +5088,76 @@ ngx_ssl_get_cipher_name(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
+     return NGX_OK;
+ }
+ 
++#ifndef OPENSSL_NO_ECH
++ngx_int_t
++ngx_ssl_get_ech_status(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
++{
++    char *inner_sni;
++    char *outer_sni;
++    char buf[PATH_MAX];
++    int echrv=SSL_ech_get_status(c->ssl->connection,&inner_sni,&outer_sni);
++    switch (echrv) {
++    case SSL_ECH_STATUS_NOT_TRIED:
++        snprintf(buf,PATH_MAX,"not attempted");
++        break;
++    case SSL_ECH_STATUS_FAILED:
++        snprintf(buf, PATH_MAX, "tried but failed");
++        break;
++    case SSL_ECH_STATUS_BAD_NAME:
++        snprintf(buf, PATH_MAX,"worked but bad name");
++        break;
++    case SSL_ECH_STATUS_SUCCESS:
++        snprintf(buf, PATH_MAX, "success");
++        break;
++    default:
++        snprintf(buf, PATH_MAX, "error getting ECH status");
++        break;
++    }
++    s->len = ngx_strlen(buf);
++    s->data = ngx_pnalloc(pool, s->len);
++    ngx_memcpy(s->data,buf,s->len);
++    return NGX_OK;
++}
++
++ngx_int_t
++ngx_ssl_get_ech_inner_sni(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
++{
++    char *inner_sni;
++    char *outer_sni;
++    int echrv=SSL_ech_get_status(c->ssl->connection,&inner_sni,&outer_sni);
++    if (echrv==SSL_ECH_STATUS_SUCCESS && inner_sni) {
++        s->len=strlen(inner_sni);
++        s->data = ngx_pnalloc(pool, s->len);
++        ngx_memcpy(s->data,inner_sni,s->len);
++    } else {
++        s->len = ngx_strlen("NONE");
++        s->data = ngx_pnalloc(pool, s->len);
++        ngx_memcpy(s->data,"NONE",s->len);
++    }
++    return NGX_OK;
++}
++
++ngx_int_t
++ngx_ssl_get_ech_outer_sni(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
++{
++    char *inner_sni;
++    char *outer_sni;
++    int echrv=SSL_ech_get_status(c->ssl->connection,&inner_sni,&outer_sni);
++    if (echrv==SSL_ECH_STATUS_SUCCESS && outer_sni) {
++        s->len=strlen(outer_sni);
++        s->data = ngx_pnalloc(pool, s->len);
++        ngx_memcpy(s->data,outer_sni,s->len);
++    } else {
++        s->len = ngx_strlen("NONE");
++        s->data = ngx_pnalloc(pool, s->len);
++        ngx_memcpy(s->data,"NONE",s->len);
++    }
++
++    return NGX_OK;
++}
++
++#endif
++
+ 
+ ngx_int_t
+ ngx_ssl_get_ciphers(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
+diff --git a/src/event/ngx_event_openssl.h b/src/event/ngx_event_openssl.h
+index 2147205d6..0308374ac 100644
+--- a/src/event/ngx_event_openssl.h
++++ b/src/event/ngx_event_openssl.h
+@@ -39,6 +39,9 @@
+ #include <openssl/rand.h>
+ #include <openssl/x509.h>
+ #include <openssl/x509v3.h>
++#ifndef OPENSSL_NO_ECH
++#include <openssl/ech.h>
++#endif
+ 
+ #define NGX_SSL_NAME     "OpenSSL"
+ 
+@@ -263,6 +266,9 @@ ngx_int_t ngx_ssl_session_cache_init(ngx_shm_zone_t *shm_zone, void *data);
+ 
+ ngx_int_t ngx_ssl_create_connection(ngx_ssl_t *ssl, ngx_connection_t *c,
+     ngx_uint_t flags);
++#ifndef OPENSSL_NO_ECH
++ngx_int_t ngx_ssl_echkeydir(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *dir);
++#endif
+ 
+ void ngx_ssl_remove_cached_session(SSL_CTX *ssl, ngx_ssl_session_t *sess);
+ ngx_int_t ngx_ssl_set_session(ngx_connection_t *c, ngx_ssl_session_t *session);
+@@ -292,6 +298,14 @@ ngx_int_t ngx_ssl_get_ciphers(ngx_connection_t *c, ngx_pool_t *pool,
+     ngx_str_t *s);
+ ngx_int_t ngx_ssl_get_curve(ngx_connection_t *c, ngx_pool_t *pool,
+     ngx_str_t *s);
++#ifndef OPENSSL_NO_ECH
++ngx_int_t ngx_ssl_get_ech_status(ngx_connection_t *c, ngx_pool_t *pool,
++    ngx_str_t *s);
++ngx_int_t ngx_ssl_get_ech_inner_sni(ngx_connection_t *c, ngx_pool_t *pool,
++    ngx_str_t *s);
++ngx_int_t ngx_ssl_get_ech_outer_sni(ngx_connection_t *c, ngx_pool_t *pool,
++    ngx_str_t *s);
++#endif
+ ngx_int_t ngx_ssl_get_curves(ngx_connection_t *c, ngx_pool_t *pool,
+     ngx_str_t *s);
+ ngx_int_t ngx_ssl_get_session_id(ngx_connection_t *c, ngx_pool_t *pool,
+diff --git a/src/http/modules/ngx_http_ssl_module.c b/src/http/modules/ngx_http_ssl_module.c
+index 0e892b04d..3ca79794b 100644
+--- a/src/http/modules/ngx_http_ssl_module.c
++++ b/src/http/modules/ngx_http_ssl_module.c
+@@ -13,7 +13,6 @@
+ #include <ngx_event_quic_openssl_compat.h>
+ #endif
+ 
+-
+ typedef ngx_int_t (*ngx_ssl_variable_handler_pt)(ngx_connection_t *c,
+     ngx_pool_t *pool, ngx_str_t *s);
+ 
+@@ -199,6 +198,15 @@ static ngx_command_t  ngx_http_ssl_commands[] = {
+       offsetof(ngx_http_ssl_srv_conf_t, session_tickets),
+       NULL },
+ 
++#ifndef OPENSSL_NO_ECH
++    { ngx_string("ssl_echkeydir"),
++      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_str_slot,
++      NGX_HTTP_SRV_CONF_OFFSET,
++      offsetof(ngx_http_ssl_srv_conf_t, echkeydir),
++      NULL },
++#endif
++
+     { ngx_string("ssl_session_ticket_key"),
+       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+       ngx_conf_set_str_array_slot,
+@@ -338,6 +346,14 @@ static ngx_http_variable_t  ngx_http_ssl_vars[] = {
+ 
+     { ngx_string("ssl_curve"), NULL, ngx_http_ssl_variable,
+       (uintptr_t) ngx_ssl_get_curve, NGX_HTTP_VAR_CHANGEABLE, 0 },
++#ifndef OPENSSL_NO_ECH
++    { ngx_string("ssl_ech_status"), NULL, ngx_http_ssl_variable,
++      (uintptr_t) ngx_ssl_get_ech_status, NGX_HTTP_VAR_CHANGEABLE, 0 },
++    { ngx_string("ssl_ech_inner_sni"), NULL, ngx_http_ssl_variable,
++      (uintptr_t) ngx_ssl_get_ech_inner_sni, NGX_HTTP_VAR_CHANGEABLE, 0 },
++    { ngx_string("ssl_ech_outer_sni"), NULL, ngx_http_ssl_variable,
++      (uintptr_t) ngx_ssl_get_ech_outer_sni, NGX_HTTP_VAR_CHANGEABLE, 0 },
++#endif
+ 
+     { ngx_string("ssl_curves"), NULL, ngx_http_ssl_variable,
+       (uintptr_t) ngx_ssl_get_curves, NGX_HTTP_VAR_CHANGEABLE, 0 },
+@@ -609,6 +625,9 @@ ngx_http_ssl_create_srv_conf(ngx_conf_t *cf)
+      *     sscf->ocsp_responder = { 0, NULL };
+      *     sscf->stapling_file = { 0, NULL };
+      *     sscf->stapling_responder = { 0, NULL };
++     *     #ifndef OPENSSL_NO_ECH
++     *     sscf->echkeydir = { 0, NULL} ;
++     *     #endif
+      */
+ 
+     sscf->prefer_server_ciphers = NGX_CONF_UNSET;
+@@ -667,6 +686,9 @@ ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
+     ngx_conf_merge_ptr_value(conf->passwords, prev->passwords, NULL);
+ 
+     ngx_conf_merge_str_value(conf->dhparam, prev->dhparam, "");
++#ifndef OPENSSL_NO_ECH
++    ngx_conf_merge_str_value(conf->echkeydir, prev->echkeydir, "");
++#endif
+ 
+     ngx_conf_merge_str_value(conf->client_certificate, prev->client_certificate,
+                          "");
+@@ -837,6 +859,12 @@ ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
+         return NGX_CONF_ERROR;
+     }
+ 
++#ifndef OPENSSL_NO_ECH
++    if (ngx_ssl_echkeydir(cf, &conf->ssl, &conf->echkeydir) != NGX_OK) {
++        return NGX_CONF_ERROR;
++    }
++#endif
++
+     if (ngx_ssl_ecdh_curve(cf, &conf->ssl, &conf->ecdh_curve) != NGX_OK) {
+         return NGX_CONF_ERROR;
+     }
+diff --git a/src/http/modules/ngx_http_ssl_module.h b/src/http/modules/ngx_http_ssl_module.h
+index c69c8ffd2..5af48f3c6 100644
+--- a/src/http/modules/ngx_http_ssl_module.h
++++ b/src/http/modules/ngx_http_ssl_module.h
+@@ -13,7 +13,6 @@
+ #include <ngx_core.h>
+ #include <ngx_http.h>
+ 
+-
+ typedef struct {
+     ngx_ssl_t                       ssl;
+ 
+@@ -39,6 +38,9 @@ typedef struct {
+     ngx_array_t                    *certificate_key_values;
+ 
+     ngx_str_t                       dhparam;
++#ifndef OPENSSL_NO_ECH
++    ngx_str_t                       echkeydir;
++#endif
+     ngx_str_t                       ecdh_curve;
+     ngx_str_t                       client_certificate;
+     ngx_str_t                       trusted_certificate;
+diff --git a/src/stream/ngx_stream_proxy_module.c b/src/stream/ngx_stream_proxy_module.c
+index e978056ef..5188c059a 100644
+--- a/src/stream/ngx_stream_proxy_module.c
++++ b/src/stream/ngx_stream_proxy_module.c
+@@ -9,6 +9,9 @@
+ #include <ngx_core.h>
+ #include <ngx_stream.h>
+ 
++#ifndef OPENSSL_NO_ECH
++#include <ngx_stream_ssl_preread_module.h>
++#endif
+ 
+ typedef struct {
+     ngx_addr_t                      *addr;
+@@ -1620,6 +1623,13 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
+     ngx_log_handler_pt            handler;
+     ngx_stream_upstream_t        *u;
+     ngx_stream_proxy_srv_conf_t  *pscf;
++#ifndef OPENSSL_NO_ECH
++    ngx_stream_ssl_preread_srv_conf_t  *sscf;
++    ngx_stream_ssl_preread_ctx_t       *ctx;
++    u_char                             *bend;
++    ngx_int_t                           echrv;
++    int                                 dec_ok = 0;
++#endif
+ 
+     u = s->upstream;
+ 
+@@ -1725,6 +1735,24 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
+                 n = 0;
+             }
+ 
++#ifndef OPENSSL_NO_ECH
++            /* handle split-mode HRR, if needed */
++            sscf = ngx_stream_get_module_srv_conf(s,
++                        ngx_stream_ssl_preread_module);
++            if (n > 0 && from_upstream == 0 && sscf->enabled) {
++                ctx = ngx_stream_get_module_ctx(s,
++                            ngx_stream_ssl_preread_module);
++                if (ctx != NULL && ctx->ech_state == 1) {
++                    bend = b->last + n;
++                    echrv = ngx_stream_do_ech(sscf, ctx, c, b->last,
++                                              &bend, &dec_ok);
++                    if (echrv == NGX_OK && dec_ok == 1) {
++                        n = bend - b->last; /* adjust size */
++                    }
++                }
++            }
++#endif
++
+             if (n >= 0) {
+                 if (limit_rate) {
+                     delay = (ngx_msec_t) (n * 1000 / limit_rate);
+diff --git a/src/stream/ngx_stream_ssl_preread_module.c b/src/stream/ngx_stream_ssl_preread_module.c
+index 3fc83ff2f..7bfad73d2 100644
+--- a/src/stream/ngx_stream_ssl_preread_module.c
++++ b/src/stream/ngx_stream_ssl_preread_module.c
+@@ -8,9 +8,19 @@
+ #include <ngx_core.h>
+ #include <ngx_stream.h>
+ 
+-
++#ifndef OPENSSL_NO_ECH
++#include <ngx_stream_ssl_preread_module.h>
++#else
++/*
++ * moved these to a header to allow access from elsewhere
++ * which is needed for ECH split-mode with HRR
++ */
+ typedef struct {
+     ngx_flag_t      enabled;
++#ifndef OPENSSL_NO_ECH
++    ngx_str_t       echkeydir;
++    ngx_ssl_t       *ssl;
++#endif
+ } ngx_stream_ssl_preread_srv_conf_t;
+ 
+ 
+@@ -27,8 +37,13 @@ typedef struct {
+     ngx_log_t      *log;
+     ngx_pool_t     *pool;
+     ngx_uint_t      state;
++#ifndef OPENSSL_NO_ECH
++    ngx_uint_t      ech_state;
++    u_char          *hrrtok;
++    size_t          hrrtoklen;
++#endif
+ } ngx_stream_ssl_preread_ctx_t;
+-
++#endif
+ 
+ static ngx_int_t ngx_stream_ssl_preread_handler(ngx_stream_session_t *s);
+ static ngx_int_t ngx_stream_ssl_preread_parse_record(
+@@ -57,6 +72,15 @@ static ngx_command_t  ngx_stream_ssl_preread_commands[] = {
+       offsetof(ngx_stream_ssl_preread_srv_conf_t, enabled),
+       NULL },
+ 
++#ifndef OPENSSL_NO_ECH
++    { ngx_string("ssl_echkeydir"),
++      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_str_slot,
++      NGX_STREAM_SRV_CONF_OFFSET,
++      offsetof(ngx_stream_ssl_preread_srv_conf_t, echkeydir),
++      NULL },
++#endif
++
+       ngx_null_command
+ };
+ 
+@@ -104,6 +128,115 @@ static ngx_stream_variable_t  ngx_stream_ssl_preread_vars[] = {
+ };
+ 
+ 
++#ifndef OPENSSL_NO_ECH
++ngx_int_t ngx_stream_do_ech(
++    ngx_stream_ssl_preread_srv_conf_t  *sscf,
++    ngx_stream_ssl_preread_ctx_t       *ctx,
++    ngx_connection_t                   *c,
++    u_char                             *p,
++    u_char                             **last,
++    int                                *dec_ok)
++{
++    int rv = 0;
++    char *inner_sni = NULL, *outer_sni = NULL;
++    unsigned char *hrrtok = NULL, *chstart = NULL, *inp = NULL;
++    size_t toklen = 0, chlen = 0, msglen = 0, innerlen = 0;
++
++    ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0, "do_ech: checking ECH");
++    chstart = p;
++    /*
++     * chew up bogus change cipher spec, if one's there when we're
++     * in midst of HRR
++     */
++    if (ctx->ech_state == 1
++        && p[0] == 20
++        && p[1] == 3
++        && p[2] == 3
++        && p[3] == 0
++        && p[4] == 1
++        && p[5] == 1) {
++        chstart += 6;
++        ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0, "do_ech: skipped CCS");
++    }
++    /*
++     * check that we are dealing with a TLSv1.3 ClientHello
++     * and establish CH length (in case of early data)
++     */
++    if (chstart[0] == 22 /* handshake */
++        && chstart[1] == 3 /* tls 1.2 or 1.3 */
++        && (chstart[2] == 3 || chstart[2] == 2 || chstart[2] == 1) /* all ok */
++        && chstart[5] == 1) { /* ClientHello */
++
++        chlen = 5 + (uint8_t)chstart[3] * 256 + (uint8_t)chstart[4];
++        msglen = *last - chstart; /* in case of early data */
++        if (msglen != chlen) {
++            ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0,
++                "do_ech: message (%z) longer than CH (%z)", msglen, chlen);
++        } else {
++            ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0,
++                "do_ech: message only has CH (%z)", chlen);
++        }
++        /* we'll at least try for ECH */
++        inp = ngx_pcalloc(c->pool, chlen);
++        if (inp == NULL) {
++            return NGX_ERROR;
++        }
++        innerlen = chlen;
++        if (ctx->ech_state != 0) {
++            ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0,
++                "do_ech: ECH 2nd go (HRR), toklen = %d", (int)ctx->hrrtoklen);
++            hrrtok = ctx->hrrtok;
++            toklen = ctx->hrrtoklen;
++        } else {
++            ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0, "do_ech: ECH 1st time");
++        }
++        rv = SSL_CTX_ech_raw_decrypt(sscf->ssl->ctx, dec_ok,
++                                    &inner_sni, &outer_sni,
++                                    chstart, chlen,
++                                    inp, &innerlen,
++                                    &hrrtok, &toklen);
++        if (ctx->ech_state == 1) {
++            OPENSSL_free(hrrtok); /* we can free that now */
++            ctx->hrrtok = NULL;
++        }
++        if (rv != 1) {
++            ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0,
++                "do_ech: ECH decrypt failed (%d)", rv);
++            return NGX_ERROR;
++        }
++        if (*dec_ok == 1) {
++            ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0,
++                "do_ech: ECH success outer_sni: %s inner_sni: %s",
++                (outer_sni?outer_sni:"NONE"),(inner_sni?inner_sni:"NONE"));
++            if (ctx->ech_state == 0) {
++                /* store hrrtok from 1st CH, in case needed later */
++                ctx->hrrtok = hrrtok;
++                ctx->hrrtoklen = toklen;
++            }
++            /* increment ech_state */
++            ctx->ech_state += 1;
++            /* swap CH's over, adding back extra data if any */
++            memcpy(chstart, inp, innerlen);
++            if (msglen > chlen) {
++                memcpy(chstart + innerlen, chstart + chlen, msglen - chlen);
++                *last = chstart + innerlen + (msglen - chlen);
++            } else {
++                *last = chstart + innerlen;
++            }
++            c->buffer->last = *last;
++        } else {
++            ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0,
++                "do_ech: ECH decrypt failed (%d)", rv);
++        }
++    } else {
++        ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0,
++            "do_ech: not a CH or CCS, contentype: %z, h/s type: %z",
++            chstart[0], chstart[5]);
++    }
++    return NGX_OK;
++}
++#endif
++
+ static ngx_int_t
+ ngx_stream_ssl_preread_handler(ngx_stream_session_t *s)
+ {
+@@ -144,11 +277,29 @@ ngx_stream_ssl_preread_handler(ngx_stream_session_t *s)
+         ctx->pool = c->pool;
+         ctx->log = c->log;
+         ctx->pos = c->buffer->pos;
++#ifndef OPENSSL_NO_ECH
++        ctx->hrrtok = NULL;
++        ctx->hrrtoklen = 0;
++        ctx->ech_state = 0;
++#endif
++
+     }
+ 
+     p = ctx->pos;
+     last = c->buffer->last;
+ 
++#ifndef OPENSSL_NO_ECH
++    /* check if we're trying ECH */
++    if (sscf->ssl != NULL && sscf->ssl->ctx != NULL) {
++        int echrv, dec_ok = 0;
++
++        echrv = ngx_stream_do_ech(sscf, ctx, c, p, &last, &dec_ok);
++        if (echrv != NGX_OK) {
++            return NGX_ERROR;
++        }
++    }
++#endif
++
+     while (last - p >= 5) {
+ 
+         if ((p[0] & 0x80) && p[2] == 1 && (p[3] == 0 || p[3] == 3)) {
+@@ -679,6 +830,10 @@ ngx_stream_ssl_preread_create_srv_conf(ngx_conf_t *cf)
+     }
+ 
+     conf->enabled = NGX_CONF_UNSET;
++#ifndef OPENSSL_NO_ECH
++    memset(&conf->echkeydir, 0, sizeof(conf->echkeydir));
++    conf->ssl = NULL;
++#endif
+ 
+     return conf;
+ }
+@@ -691,6 +846,31 @@ ngx_stream_ssl_preread_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
+     ngx_stream_ssl_preread_srv_conf_t *conf = child;
+ 
+     ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
++#ifndef OPENSSL_NO_ECH
++    ngx_conf_merge_str_value(conf->echkeydir, prev->echkeydir, "");
++    if (ngx_strcmp(conf->echkeydir.data, "") != 0) {
++        const SSL_METHOD *meth = NULL;
++        SSL_CTX *sctx = NULL;
++
++        meth = TLS_server_method();
++        if (cf == NULL || cf->log == NULL || meth == NULL) {
++            return NULL;
++        }
++        sctx = SSL_CTX_new(meth);
++        if (sctx == NULL) {
++            return NULL;
++        }
++        conf->ssl = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
++        if (conf->ssl == NULL) {
++            return NULL;
++        }
++        conf->ssl->ctx = sctx;
++        conf->ssl->log = cf->log;
++        if (ngx_ssl_echkeydir(cf, conf->ssl, &conf->echkeydir) != NGX_OK) {
++            return NULL;
++        }
++    }
++#endif
+ 
+     return NGX_CONF_OK;
+ }
+diff --git a/src/stream/ngx_stream_ssl_preread_module.h b/src/stream/ngx_stream_ssl_preread_module.h
+new file mode 100644
+index 000000000..6c07219ae
+--- /dev/null
++++ b/src/stream/ngx_stream_ssl_preread_module.h
+@@ -0,0 +1,46 @@
++
++#ifndef _NGX_STREAM_SSL_PREREAD_MODULE_H_INCLUDED_
++#define _NGX_STREAM_SSL_PREREAD_MODULE_H_INCLUDED_
++
++#ifndef OPENSSL_NO_ECH
++typedef struct {
++    ngx_flag_t      enabled;
++#ifndef OPENSSL_NO_ECH
++    ngx_str_t       echkeydir;
++    ngx_ssl_t       *ssl;
++#endif
++} ngx_stream_ssl_preread_srv_conf_t;
++
++
++typedef struct {
++    size_t          left;
++    size_t          size;
++    size_t          ext;
++    u_char         *pos;
++    u_char         *dst;
++    u_char          buf[4];
++    u_char          version[2];
++    ngx_str_t       host;
++    ngx_str_t       alpn;
++    ngx_log_t      *log;
++    ngx_pool_t     *pool;
++    ngx_uint_t      state;
++#ifndef OPENSSL_NO_ECH
++    ngx_uint_t      ech_state;
++    u_char          *hrrtok;
++    size_t          hrrtoklen;
++#endif
++} ngx_stream_ssl_preread_ctx_t;
++
++extern ngx_module_t  ngx_stream_ssl_preread_module;
++
++ngx_int_t ngx_stream_do_ech(
++    ngx_stream_ssl_preread_srv_conf_t  *sscf,
++    ngx_stream_ssl_preread_ctx_t       *ctx,
++    ngx_connection_t                   *c,
++    u_char                             *p,
++    u_char                             **last,
++    int                                *dec_ok);
++
++#endif
++#endif
+-- 
+2.48.1
+

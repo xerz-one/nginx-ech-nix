@@ -1,0 +1,42 @@
+From 4cdbe04d98891bca8487737af5d57bff4d5fe98a Mon Sep 17 00:00:00 2001
+From: Tomas Mraz <tomas@openssl.org>
+Date: Wed, 11 Sep 2024 17:41:30 +0200
+Subject: [PATCH 4/6] Fixup conflicting SSL_R_ECH_REQUIRED
+
+Reviewed-by: Matt Caswell <matt@openssl.org>
+Reviewed-by: Tim Hudson <tjh@openssl.org>
+(Merged from https://github.com/openssl/openssl/pull/25435)
+---
+ crypto/err/openssl.txt   | 2 +-
+ include/openssl/sslerr.h | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index 9285b2e48a..ecc29e4533 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -1419,7 +1419,7 @@ SSL_R_DTLS_MESSAGE_TOO_BIG:334:dtls message too big
+ SSL_R_DUPLICATE_COMPRESSION_ID:309:duplicate compression id
+ SSL_R_ECC_CERT_NOT_FOR_SIGNING:318:ecc cert not for signing
+ SSL_R_ECDH_REQUIRED_FOR_SUITEB_MODE:374:ecdh required for suiteb mode
+-SSL_R_ECH_REQUIRED:420:ech required
++SSL_R_ECH_REQUIRED:421:ech required
+ SSL_R_EE_KEY_TOO_SMALL:399:ee key too small
+ SSL_R_EMPTY_RAW_PUBLIC_KEY:349:empty raw public key
+ SSL_R_EMPTY_SRTP_PROTECTION_PROFILE_LIST:354:empty srtp protection profile list
+diff --git a/include/openssl/sslerr.h b/include/openssl/sslerr.h
+index a626ae9734..b252e8084d 100644
+--- a/include/openssl/sslerr.h
++++ b/include/openssl/sslerr.h
+@@ -112,7 +112,7 @@
+ # define SSL_R_DUPLICATE_COMPRESSION_ID                   309
+ # define SSL_R_ECC_CERT_NOT_FOR_SIGNING                   318
+ # define SSL_R_ECDH_REQUIRED_FOR_SUITEB_MODE              374
+-# define SSL_R_ECH_REQUIRED                               420
++# define SSL_R_ECH_REQUIRED                               421
+ # define SSL_R_EE_KEY_TOO_SMALL                           399
+ # define SSL_R_EMPTY_RAW_PUBLIC_KEY                       349
+ # define SSL_R_EMPTY_SRTP_PROTECTION_PROFILE_LIST         354
+-- 
+2.48.1
+

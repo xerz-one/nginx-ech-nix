@@ -1,0 +1,2003 @@
+From 4666604387904cb5fc62574189f4ce3e506f87e2 Mon Sep 17 00:00:00 2001
+From: Stephen Farrell <stephen.farrell@cs.tcd.ie>
+Date: Thu, 15 Aug 2024 01:27:24 +0100
+Subject: [PATCH 3/6] ECH build artefacts and a bit of code
+
+Reviewed-by: Tomas Mraz <tomas@openssl.org>
+Reviewed-by: Matt Caswell <matt@openssl.org>
+(Merged from https://github.com/openssl/openssl/pull/25193)
+---
+ Configurations/unix-Makefile.tmpl |   5 +-
+ Configure                         |   3 +-
+ INSTALL.md                        |   5 +
+ apps/build.info                   |   1 +
+ apps/ech.c                        | 199 +++++++++++++
+ apps/lib/s_cb.c                   |   4 +
+ apps/list.c                       |   3 +
+ crypto/err/openssl.txt            |   1 +
+ demos/sslecho/Makefile            |   4 +-
+ demos/sslecho/README.md           |  45 +++
+ doc/build.info                    |  14 +
+ doc/designs/ech-api.md            |  51 ++--
+ doc/man1/build.info               |   1 +
+ doc/man1/openssl-ech.pod.in       |  94 ++++++
+ doc/man1/openssl.pod              |   4 +
+ doc/man3/SSL_CTX_set_options.pod  |  24 ++
+ doc/man3/SSL_set1_echstore.pod    | 187 ++++++++++++
+ include/openssl/ech.h             | 137 +++++++++
+ include/openssl/pem.h             |   1 +
+ include/openssl/ssl.h.in          |  28 ++
+ include/openssl/sslerr.h          |   1 +
+ include/openssl/tls1.h            |   8 +
+ include/openssl/types.h           |   6 +
+ ssl/build.info                    |   1 +
+ ssl/ech.c                         | 467 ++++++++++++++++++++++++++++++
+ ssl/ech_local.h                   | 102 +++++++
+ ssl/ssl_err.c                     |   1 +
+ test/build.info                   |   7 +-
+ test/ech_test.c                   |  66 +++++
+ test/recipes/30-test_ech.t        |  21 ++
+ util/libssl.num                   |  28 ++
+ util/perl/TLSProxy/Message.pm     |   2 +
+ 32 files changed, 1491 insertions(+), 30 deletions(-)
+ create mode 100644 apps/ech.c
+ create mode 100644 doc/man1/openssl-ech.pod.in
+ create mode 100644 doc/man3/SSL_set1_echstore.pod
+ create mode 100644 include/openssl/ech.h
+ create mode 100644 ssl/ech.c
+ create mode 100644 ssl/ech_local.h
+ create mode 100644 test/ech_test.c
+ create mode 100644 test/recipes/30-test_ech.t
+
+diff --git a/Configurations/unix-Makefile.tmpl b/Configurations/unix-Makefile.tmpl
+index 91e2646580..af75243104 100644
+--- a/Configurations/unix-Makefile.tmpl
++++ b/Configurations/unix-Makefile.tmpl
+@@ -135,7 +135,7 @@ GENERATED_PODS={- # common0.tmpl provides @generated
+                        fill_lines(" ", $COLUMNS - 15,
+                                   map { my $x = $_;
+                                         (
+-                                          grep { 
++                                          grep {
+                                                  $unified_info{attributes}->{depends}
+                                                  ->{$x}->{$_}->{pod} // 0
+                                                }
+@@ -1328,7 +1328,8 @@ errors:
+            include/openssl/dtls1.h
+            include/openssl/srtp.h
+            include/openssl/quic.h
+-           include/openssl/sslerr_legacy.h );
++           include/openssl/sslerr_legacy.h
++           include/openssl/ech.h);
+    my @cryptoheaders_tmpl =
+        qw( include/internal/dso.h
+            include/internal/o_dir.h
+diff --git a/Configure b/Configure
+index 2dd6234d1c..32f65634d9 100755
+--- a/Configure
++++ b/Configure
+@@ -464,6 +464,7 @@ my @disablables = (
+     "ecdh",
+     "ecdsa",
+     "ecx",
++    "ech",
+     "egd",
+     "engine",
+     "err",
+@@ -619,7 +620,7 @@ my @disable_cascades = (
+                              "blake2", "bf", "camellia", "cast", "chacha",
+                              "cmac", "cms", "cmp", "comp", "ct",
+                              "des", "dgram", "dh", "dsa",
+-                             "ec", "engine",
++                             "ec", "ech", "engine",
+                              "filenames",
+                              "idea", "ktls",
+                              "md4", "multiblock", "nextprotoneg",
+diff --git a/INSTALL.md b/INSTALL.md
+index 0f686532d3..26563a90da 100644
+--- a/INSTALL.md
++++ b/INSTALL.md
+@@ -781,6 +781,11 @@ Don't build support for Elliptic Curves.
+ 
+ Don't build support for binary Elliptic Curves
+ 
++### no-ech
++
++Don't build support for Encrypted Client Hello (ECH) extension (draft-ietf-tls-esni)
++TODO(ECH) update link to RFC.
++
+ ### enable-ec_nistp_64_gcc_128
+ 
+ Enable support for optimised implementations of some commonly used NIST
+diff --git a/apps/build.info b/apps/build.info
+index 020d129f8c..701683a36d 100644
+--- a/apps/build.info
++++ b/apps/build.info
+@@ -18,6 +18,7 @@ $OPENSSLSRC=\
+         pkcs8.c pkey.c pkeyparam.c pkeyutl.c prime.c rand.c req.c \
+         s_client.c s_server.c s_time.c sess_id.c smime.c speed.c \
+         spkac.c verify.c version.c x509.c rehash.c storeutl.c \
++        ech.c \
+         list.c info.c fipsinstall.c pkcs12.c
+ IF[{- !$disabled{'ec'} -}]
+   $OPENSSLSRC=$OPENSSLSRC ec.c ecparam.c
+diff --git a/apps/ech.c b/apps/ech.c
+new file mode 100644
+index 0000000000..06f123bca6
+--- /dev/null
++++ b/apps/ech.c
+@@ -0,0 +1,199 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "apps.h"
++#include "progs.h"
++#include <openssl/ssl.h>
++#include <openssl/bio.h>
++#include <openssl/evp.h>
++#include <openssl/err.h>
++#include <openssl/bn.h>
++#include <openssl/pem.h>
++#include <openssl/rand.h>
++#include <openssl/hpke.h>
++
++#include <openssl/objects.h>
++#include <openssl/x509.h>
++
++#ifndef OPENSSL_NO_ECH
++
++# define OSSL_ECH_KEYGEN_MODE    0 /* default: generate a key pair/ECHConfig */
++# define OSSL_ECH_SELPRINT_MODE  1 /* we can print/down-select ECHConfigList */
++
++# define PEM_SELECT_ALL    -1 /* to indicate we're not downselecting another */
++
++typedef enum OPTION_choice {
++    /* standard openssl options */
++    OPT_ERR = -1, OPT_EOF = 0, OPT_HELP, OPT_VERBOSE,
++    OPT_PEMOUT,
++    /* ECHConfig specifics */
++    OPT_PUBLICNAME, OPT_ECHVERSION,
++    OPT_MAXNAMELENGTH, OPT_HPKESUITE
++} OPTION_CHOICE;
++
++const OPTIONS ech_options[] = {
++    OPT_SECTION("General options"),
++    {"help", OPT_HELP, '-', "Display this summary"},
++    {"verbose", OPT_VERBOSE, '-', "Provide additional output"},
++    OPT_SECTION("Key generation"),
++    {"pemout", OPT_PEMOUT, '>',
++     "Private key and ECHConfig [default echconfig.pem]"},
++    {"public_name", OPT_PUBLICNAME, 's', "public_name value"},
++    {"max_name_len", OPT_MAXNAMELENGTH, 'n',
++     "Maximum host name length value [default: 0]"},
++    {"suite", OPT_HPKESUITE, 's', "HPKE ciphersuite: e.g. \"0x20,1,3\""},
++    {"ech_version", OPT_ECHVERSION, 'n',
++     "ECHConfig version [default 0xff0d (13)]"},
++    {NULL}
++};
++
++/**
++ * @brief map version string like 0xff01 or 65291 to uint16_t
++ * @param arg is the version string, from command line
++ * @return is the uint16_t value (with zero for error cases)
++ */
++static uint16_t verstr2us(char *arg)
++{
++    long lv = strtol(arg, NULL, 0);
++    uint16_t rv = 0;
++
++    if (lv < 0xffff && lv > 0) {
++        rv = (uint16_t)lv;
++    }
++    return rv;
++}
++
++int ech_main(int argc, char **argv)
++{
++    char *prog = NULL;
++    OPTION_CHOICE o;
++    int verbose = 0;
++    char *pemfile = NULL;
++    char *public_name = NULL;
++    char *suitestr = NULL;
++    uint16_t ech_version = OSSL_ECH_CURRENT_VERSION;
++    uint8_t max_name_length = 0;
++    OSSL_HPKE_SUITE hpke_suite = OSSL_HPKE_SUITE_DEFAULT;
++    int mode = OSSL_ECH_KEYGEN_MODE; /* key generation */
++
++    prog = opt_init(argc, argv, ech_options);
++    while ((o = opt_next()) != OPT_EOF) {
++        switch (o) {
++        case OPT_EOF:
++        case OPT_ERR:
++            BIO_printf(bio_err, "%s: Use -help for summary.\n", prog);
++            goto end;
++        case OPT_HELP:
++            opt_help(ech_options);
++            goto end;
++        case OPT_VERBOSE:
++            verbose = 1;
++            break;
++        case OPT_PEMOUT:
++            pemfile = opt_arg();
++            break;
++        case OPT_PUBLICNAME:
++            public_name = opt_arg();
++            break;
++        case OPT_ECHVERSION:
++            ech_version = verstr2us(opt_arg());
++            break;
++        case OPT_MAXNAMELENGTH:
++            {
++                long tmp = strtol(opt_arg(), NULL, 10);
++
++                if (tmp < 0 || tmp > OSSL_ECH_MAX_MAXNAMELEN) {
++                    BIO_printf(bio_err,
++                               "max name length out of range [0,%d] (%ld)\n",
++                               OSSL_ECH_MAX_MAXNAMELEN, tmp);
++                    goto opthelp;
++                } else {
++                    max_name_length = (uint8_t)tmp;
++                }
++            }
++            break;
++        case OPT_HPKESUITE:
++            suitestr = opt_arg();
++            break;
++        }
++    }
++
++    argc = opt_num_rest();
++    argv = opt_rest();
++    if (argc != 0) {
++        BIO_printf(bio_err, "%s: Unknown parameter %s\n", prog, argv[0]);
++        goto opthelp;
++    }
++
++    /*
++     * Check ECH-specific inputs
++     */
++    switch (ech_version) {
++    case OSSL_ECH_RFCXXXX_VERSION: /* fall through */
++    case 13:
++        ech_version = OSSL_ECH_RFCXXXX_VERSION;
++        break;
++    default:
++        BIO_printf(bio_err, "Un-supported version (0x%04x)\n", ech_version);
++        goto end;
++    }
++
++    if (max_name_length > TLSEXT_MAXLEN_host_name) {
++        BIO_printf(bio_err, "Weird max name length (0x%04x) - biggest is "
++                   "(0x%04x) - exiting\n", max_name_length,
++                   TLSEXT_MAXLEN_host_name);
++        ERR_print_errors(bio_err);
++        goto end;
++    }
++
++    if (suitestr != NULL) {
++        if (OSSL_HPKE_str2suite(suitestr, &hpke_suite) != 1) {
++            BIO_printf(bio_err, "Bad OSSL_HPKE_SUITE (%s)\n", suitestr);
++            ERR_print_errors(bio_err);
++            goto end;
++        }
++    }
++
++    /* Set default if needed */
++    if (pemfile == NULL)
++        pemfile = "echconfig.pem";
++
++    if (mode == OSSL_ECH_KEYGEN_MODE) {
++        OSSL_ECHSTORE *es = NULL;
++        BIO *ecf = NULL;
++
++        if (verbose)
++            BIO_printf(bio_err, "Calling OSSL_ECHSTORE_new_config\n");
++        if ((ecf = BIO_new_file(pemfile, "w")) == NULL 
++            || (es = OSSL_ECHSTORE_new(NULL, NULL)) == NULL
++            || OSSL_ECHSTORE_new_config(es, ech_version, max_name_length,
++                                        public_name, hpke_suite) != 1
++            || OSSL_ECHSTORE_write_pem(es, 0, ecf) != 1) {
++            BIO_printf(bio_err, "OSSL_ECHSTORE_new_config error\n");
++            goto end;
++        }
++        if (verbose)
++            BIO_printf(bio_err, "OSSL_ECHSTORE_new_config success\n");
++        OSSL_ECHSTORE_free(es);
++        BIO_free_all(ecf);
++        return 1;
++    }
++
++opthelp:
++    BIO_printf(bio_err, "%s: Use -help for summary.\n", prog);
++    goto end;
++
++end:
++    return 0;
++}
++
++#endif
+diff --git a/apps/lib/s_cb.c b/apps/lib/s_cb.c
+index 026315406e..5ca314d109 100644
+--- a/apps/lib/s_cb.c
++++ b/apps/lib/s_cb.c
+@@ -772,6 +772,10 @@ static const STRINT_PAIR tlsext_types[] = {
+     {"certificate authorities", TLSEXT_TYPE_certificate_authorities},
+     {"post handshake auth", TLSEXT_TYPE_post_handshake_auth},
+     {"early_data", TLSEXT_TYPE_early_data},
++#ifndef OPENSSL_NO_ECH
++    {"encrypted ClientHello (draft-13)", TLSEXT_TYPE_ech},
++    {"outer exts", TLSEXT_TYPE_outer_extensions},
++#endif
+     {NULL}
+ };
+ 
+diff --git a/apps/list.c b/apps/list.c
+index c0b0a5a4c4..b07afeecd6 100644
+--- a/apps/list.c
++++ b/apps/list.c
+@@ -1498,6 +1498,9 @@ static void list_disabled(void)
+ #ifdef OPENSSL_NO_ZSTD
+     BIO_puts(bio_out, "ZSTD\n");
+ #endif
++#ifdef OPENSSL_NO_ECH
++    BIO_puts(bio_out, "ECH\n");
++#endif
+ }
+ 
+ /* Unified enum for help and list commands. */
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index 4d60b478be..9285b2e48a 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -1419,6 +1419,7 @@ SSL_R_DTLS_MESSAGE_TOO_BIG:334:dtls message too big
+ SSL_R_DUPLICATE_COMPRESSION_ID:309:duplicate compression id
+ SSL_R_ECC_CERT_NOT_FOR_SIGNING:318:ecc cert not for signing
+ SSL_R_ECDH_REQUIRED_FOR_SUITEB_MODE:374:ecdh required for suiteb mode
++SSL_R_ECH_REQUIRED:420:ech required
+ SSL_R_EE_KEY_TOO_SMALL:399:ee key too small
+ SSL_R_EMPTY_RAW_PUBLIC_KEY:349:empty raw public key
+ SSL_R_EMPTY_SRTP_PROTECTION_PROFILE_LIST:354:empty srtp protection profile list
+diff --git a/demos/sslecho/Makefile b/demos/sslecho/Makefile
+index defb1597e1..79b0efe697 100644
+--- a/demos/sslecho/Makefile
++++ b/demos/sslecho/Makefile
+@@ -4,7 +4,7 @@
+ #
+ #    LD_LIBRARY_PATH=../.. ./sslecho
+ 
+-TESTS = sslecho
++TESTS = sslecho echecho
+ 
+ CFLAGS  = -I../../include -g -Wall
+ LDFLAGS = -L../..
+@@ -14,6 +14,8 @@ all: $(TESTS)
+ 
+ sslecho: main.o
+ 
++echecho: echecho.o
++
+ $(TESTS):
+ 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+ 
+diff --git a/demos/sslecho/README.md b/demos/sslecho/README.md
+index 58f7ca0724..8ef3e93b74 100644
+--- a/demos/sslecho/README.md
++++ b/demos/sslecho/README.md
+@@ -24,3 +24,48 @@ The cert.pem and key.pem files included are self signed certificates with the
+ "Common Name" of 'localhost'.
+ 
+ Best to create the 'pem' files using an actual hostname.
++
++Encrypted Client Hello (ECH) Variant
++====================================
++
++``echecho.c`` implements the same functionality but demonstrates minimal code
++changes needed to use ECH. The ``echecho`` binary has the same user interface
++discussed above but enables ECH for the connection, based on hard-coded ECH
++configuration data. A real server would load file(s), and a real client would
++acquire an ECHConfigList from the DNS.
++
++All that's required to use ECH is to load ECH data via `OSSL_ECHSTORE_read_*`
++APIs and then enable ECH via ``SSL_CTX_set1_echstore()``. Both client and
++server check and print out the status of ECH using ``SSL_ech_get1_status()``,
++but that's optional.
++
++To run the server:
++
++            $ LD_LIBRARY_PATH=../.. ./echecho s
++
++To run the client:
++
++            $ LD_LIBRARY_PATH=../.. ./echecho c localhost
++
++All going well both server and client will print the ECH status at the
++start of each connection. That looks like:
++
++            ECH worked (status: 1, inner: localhost, outer: example.com)
++
++If the non-ECH demo client (``sslecho``) is used instead the server will
++output:
++
++            ECH failed/not-tried (status: -101, inner: (null), outer: (null))
++
++If the non-ECH demo server (i.e., ``sslecho``) is used, the client will exit
++with an error as ECH was attempted and failed. In a debug build, that looks
++like:
++
++            80EBEE54227F0000:error:0A000163:SSL routines:tls_process_initial_server_flight:ech required:ssl/statem/statem_clnt.c:3274:
++
++A real client would likely fall back to not using ECH, but the above
++is ok for a demo.
++
++In that case, the server will also exit based on the ECH alert from the client:
++
++            403787A8307F0000:error:0A000461:SSL routines:ssl3_read_bytes:reason(1121):../ssl/record/rec_layer_s3.c:1588:SSL alert number 121
+diff --git a/doc/build.info b/doc/build.info
+index 6ad291201d..17374ad5f7 100644
+--- a/doc/build.info
++++ b/doc/build.info
+@@ -82,6 +82,12 @@ DEPEND[man/man1/openssl-ec.1]=man1/openssl-ec.pod
+ GENERATE[man/man1/openssl-ec.1]=man1/openssl-ec.pod
+ DEPEND[man1/openssl-ec.pod]{pod}=man1/openssl-ec.pod.in
+ GENERATE[man1/openssl-ec.pod]=man1/openssl-ec.pod.in
++DEPEND[html/man1/openssl-ech.html]=man1/openssl-ech.pod
++GENERATE[html/man1/openssl-ech.html]=man1/openssl-ech.pod
++DEPEND[man/man1/openssl-ech.1]=man1/openssl-ech.pod
++GENERATE[man/man1/openssl-ech.1]=man1/openssl-ech.pod
++DEPEND[man1/openssl-ech.pod]{pod}=man1/openssl-ech.pod.in
++GENERATE[man1/openssl-ech.pod]=man1/openssl-ech.pod.in
+ DEPEND[html/man1/openssl-ecparam.html]=man1/openssl-ecparam.pod
+ GENERATE[html/man1/openssl-ecparam.html]=man1/openssl-ecparam.pod
+ DEPEND[man/man1/openssl-ecparam.1]=man1/openssl-ecparam.pod
+@@ -361,6 +367,7 @@ html/man1/openssl-dhparam.html \
+ html/man1/openssl-dsa.html \
+ html/man1/openssl-dsaparam.html \
+ html/man1/openssl-ec.html \
++html/man1/openssl-ech.html \
+ html/man1/openssl-ecparam.html \
+ html/man1/openssl-enc.html \
+ html/man1/openssl-engine.html \
+@@ -421,6 +428,7 @@ man/man1/openssl-dhparam.1 \
+ man/man1/openssl-dsa.1 \
+ man/man1/openssl-dsaparam.1 \
+ man/man1/openssl-ec.1 \
++man/man1/openssl-ech.1 \
+ man/man1/openssl-ecparam.1 \
+ man/man1/openssl-enc.1 \
+ man/man1/openssl-engine.1 \
+@@ -2739,6 +2747,10 @@ DEPEND[html/man3/SSL_session_reused.html]=man3/SSL_session_reused.pod
+ GENERATE[html/man3/SSL_session_reused.html]=man3/SSL_session_reused.pod
+ DEPEND[man/man3/SSL_session_reused.3]=man3/SSL_session_reused.pod
+ GENERATE[man/man3/SSL_session_reused.3]=man3/SSL_session_reused.pod
++DEPEND[html/man3/SSL_set1_echstore.html]=man3/SSL_set1_echstore.pod
++GENERATE[html/man3/SSL_set1_echstore.html]=man3/SSL_set1_echstore.pod
++DEPEND[man/man3/SSL_set1_echstore.3]=man3/SSL_set1_echstore.pod
++GENERATE[man/man3/SSL_set1_echstore.3]=man3/SSL_set1_echstore.pod
+ DEPEND[html/man3/SSL_set1_host.html]=man3/SSL_set1_host.pod
+ GENERATE[html/man3/SSL_set1_host.html]=man3/SSL_set1_host.pod
+ DEPEND[man/man3/SSL_set1_host.3]=man3/SSL_set1_host.pod
+@@ -3692,6 +3704,7 @@ html/man3/SSL_read.html \
+ html/man3/SSL_read_early_data.html \
+ html/man3/SSL_rstate_string.html \
+ html/man3/SSL_session_reused.html \
++html/man3/SSL_set1_echstore.html \
+ html/man3/SSL_set1_host.html \
+ html/man3/SSL_set1_initial_peer_addr.html \
+ html/man3/SSL_set1_server_cert_type.html \
+@@ -4356,6 +4369,7 @@ man/man3/SSL_read.3 \
+ man/man3/SSL_read_early_data.3 \
+ man/man3/SSL_rstate_string.3 \
+ man/man3/SSL_session_reused.3 \
++man/man3/SSL_set1_echstore.3 \
+ man/man3/SSL_set1_host.3 \
+ man/man3/SSL_set1_initial_peer_addr.3 \
+ man/man3/SSL_set1_server_cert_type.3 \
+diff --git a/doc/designs/ech-api.md b/doc/designs/ech-api.md
+index 90fed89172..eb78bbc25d 100644
+--- a/doc/designs/ech-api.md
++++ b/doc/designs/ech-api.md
+@@ -173,25 +173,25 @@ used to authenticate servers. Notably:
+ 
+ - ECH private keys are expected to be rotated roughly hourly, rather than every
+   month or two for TLS server private keys. Hourly ECH key rotation is an
+-attempt to provide better forward secrecy, given ECH implements an
+-ephemeral-static ECDH scheme.
++  attempt to provide better forward secrecy, given ECH implements an
++  ephemeral-static ECDH scheme.
+ 
+ - ECH private keys stand alone - there are no hierarchies and there is no
+-chaining, and no certificates and no defined relationships between current
+-and older ECH private keys. The expectation is that a "current" ECH public key
+-will be published in the DNS and that plus approx. 2 "older" ECH private keys
+-will remain usable for decryption at any given time. This is a way to balance
+-DNS TTLs versus forward secrecy and robustness.
++  chaining, and no certificates and no defined relationships between current
++  and older ECH private keys. The expectation is that a "current" ECH public key
++  will be published in the DNS and that plus approx. 2 "older" ECH private keys
++  will remain usable for decryption at any given time. This is a way to balance
++  DNS TTLs versus forward secrecy and robustness.
+ 
+ - In particular, the above means that we do not see any need to repeatedly
+-parse or process related ECHConfigList structures - each can be processed
+-independently for all practical purposes.
++  parse or process related ECHConfigList structures - each can be processed
++  independently for all practical purposes.
+ 
+ - There are all the usual algorithm variations, and those will likely result in
+-the same x25519 versus p256 combinatorics. How that plays out has yet to be
+-seen as FIPS compliance for ECH is not (yet) a thing. For OpenSSL, it seems
+-wise to be agnostic and support all relevant combinations. (And doing so is not
+-that hard.)
++  the same x25519 versus p256 combinatorics. How that plays out has yet to be
++  seen as FIPS compliance for ECH is not (yet) a thing. For OpenSSL, it seems
++  wise to be agnostic and support all relevant combinations. (And doing so is not
++  that hard.)
+ 
+ ECH Store APIs
+ --------------
+@@ -206,7 +206,7 @@ typedef struct ossl_echstore_st OSSL_ECHSTORE;
+ /* if a caller wants to index the last entry in the store */
+ # define OSSL_ECHSTORE_LAST -1
+ 
+-OSSL_ECHSTORE *OSSL_ECHSTORE_init(OSSL_LIB_CTX *libctx, const char *propq);
++OSSL_ECHSTORE *OSSL_ECHSTORE_new(OSSL_LIB_CTX *libctx, const char *propq);
+ void OSSL_ECHSTORE_free(OSSL_ECHSTORE *es);
+ int OSSL_ECHSTORE_new_config(OSSL_ECHSTORE *es,
+                              uint16_t echversion, uint8_t max_name_length,
+@@ -226,7 +226,7 @@ int OSSL_ECHSTORE_num_keys(OSSL_ECHSTORE *es, int *numkeys);
+ int OSSL_ECHSTORE_flush_keys(OSSL_ECHSTORE *es, time_t age);
+ ```
+ 
+-`OSSL_ECHSTORE_init()` and `OSSL_ECHSTORE_free()` are relatively obvious.
++`OSSL_ECHSTORE_new()` and `OSSL_ECHSTORE_free()` are relatively obvious.
+ 
+ `OSSL_ECHSTORE_new_config()` allows the caller to create a new private key
+ value and the related "singleton" ECHConfigList structure.
+@@ -288,6 +288,7 @@ To access the `OSSL_ECHSTORE` associated with an `SSL_CTX` or
+ OSSL_ECHSTORE *SSL_CTX_get1_echstore(const SSL_CTX *ctx);
+ OSSL_ECHSTORE *SSL_get1_echstore(const SSL *s);
+ ```
++
+ The resulting `OSSL_ECHSTORE` can be modified and then re-associated
+ with an `SSL_CTX` or `SSL` connection.
+ 
+@@ -374,20 +375,20 @@ Some notes on the above ECHConfig fields:
+ - `version` should be `OSSL_ECH_CURRENT_VERSION` for the current version.
+ 
+ - `public_name` field is the name used in the SNI of the outer ClientHello, and
+-that a server ought be able to authenticate if using the `retry_configs`
+-fallback mechanism.
++  that a server ought be able to authenticate if using the `retry_configs`
++  fallback mechanism.
+ 
+ - `config_id` is a one-octet value used by servers to select which private
+-value to use to attempt ECH decryption. Servers can also do trial decryption
+-if desired, as clients might use a random value for the `confid_id` as an
+-anti-fingerprinting mechanism. (The use of one octet for this value was the
+-result of an extended debate about efficiency versus fingerprinting.)
++  value to use to attempt ECH decryption. Servers can also do trial decryption
++  if desired, as clients might use a random value for the `confid_id` as an
++  anti-fingerprinting mechanism. (The use of one octet for this value was the
++  result of an extended debate about efficiency versus fingerprinting.)
+ 
+ - The `max_name_length` is an element of the ECHConfigList that is used by
+-clients as part of a padding algorithm. (That design is part of the spec, but
+-isn't necessarily great - the idea is to include the longest value that might
+-be the length of a DNS name included as an inner CH SNI.) A value of 0 is
+-perhaps most likely to be used, indicating that the maximum isn't known.
++  clients as part of a padding algorithm. (That design is part of the spec, but
++  isn't necessarily great - the idea is to include the longest value that might
++  be the length of a DNS name included as an inner CH SNI.) A value of 0 is
++  perhaps most likely to be used, indicating that the maximum isn't known.
+ 
+ Essentially, an ECH store is a set of ECHConfig values, plus optionally
+ (for servers), relevant private key value information.
+diff --git a/doc/man1/build.info b/doc/man1/build.info
+index b796fce42f..4e9d36cd6a 100644
+--- a/doc/man1/build.info
++++ b/doc/man1/build.info
+@@ -16,6 +16,7 @@ DEPEND[openssl-dsaparam.pod]=../perlvars.pm
+ DEPEND[openssl-dsa.pod]=../perlvars.pm
+ DEPEND[openssl-ecparam.pod]=../perlvars.pm
+ DEPEND[openssl-ec.pod]=../perlvars.pm
++DEPEND[openssl-ech.pod]=../perlvars.pm
+ DEPEND[openssl-enc.pod]=../perlvars.pm
+ DEPEND[openssl-engine.pod]=../perlvars.pm
+ DEPEND[openssl-errstr.pod]=../perlvars.pm
+diff --git a/doc/man1/openssl-ech.pod.in b/doc/man1/openssl-ech.pod.in
+new file mode 100644
+index 0000000000..b7736d4b96
+--- /dev/null
++++ b/doc/man1/openssl-ech.pod.in
+@@ -0,0 +1,94 @@
++=pod
++{- OpenSSL::safe::output_do_not_edit_headers(); -}
++
++=head1 NAME
++
++openssl-ech - ECH key generation
++
++=head1 SYNOPSIS
++
++B<openssl> B<ech>
++[B<-help>]
++[B<-verbose>]
++[B<-pemout> I<file>]
++[B<-public_name> I<name>]
++[B<-max_name_len> I<len>]
++[B<-suite> I<suite_str>]
++[B<-ech_version> I<version>]
++
++=head1 DESCRIPTION
++
++The L<openssl-ech(1)> command generates Encrypted Client Hello (ECH) private keys 
++and public keys in the ECHConfig format.
++
++The "ECHConfig PEM file" format mentioned below is specified in
++L<https://datatracker.ietf.org/doc/draft-farrell-tls-pemesni/> and consists of
++one private key in PKCS#8 format and a base64 encoded ECHConfig containing one
++matching public value.
++
++=head1 OPTIONS
++
++=over 4
++
++=item B<-help>
++
++Print out a usage message.
++
++=item B<-verbose>
++
++Print more verbosely.
++
++=item B<-pemout> I<file> 
++
++Name of output ECHConfig PEM file.
++
++=item B<-public_name> I<name>
++
++The DNS name to use in the "public_name" field of the ECHConfig.
++
++=item B<-max_name_len> I<num>
++
++Maximum name length field value to use in the ECHConfig.
++
++=item B<-suite> I<str>
++
++HPKE suite to use in the ECHConfig.
++
++=item B<-ech_version> I<version>
++
++The ECH version to use in the ECHConfig. Only 0xfe0d is supported in this version.
++
++=back
++
++=head1 NOTES
++
++Ciphersuites are specified using a comma-separated list of IANA-registered
++codes/numbers e.g. "-c 0x20,1,3" or a comma-separated list of strings from:
++- KEMs: p256, p384, p521, x25519, x448
++- KDFs: hkdf-sha256, hkdf-sha384, hkdf-sha512
++- AEADs: aes128gcm, aes256gcm, chachapoly1305
++
++For example the default is: x25519, hkdf-sha256, aes128gcm
++See L<OSSL_HPKE_CTX_new(3)> for details.
++
++=head1 SEE ALSO
++
++L<openssl(1)>,
++L<openssl-s_client(1)>,
++L<openssl-s_server(1)>,
++L<SSL_set1_echstore(3)>
++
++=head1 HISTORY
++
++This functionality described here was added in OpenSSL 3.5.
++
++=head1 COPYRIGHT
++
++Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++
++Licensed under the Apache License 2.0 (the "License").  You may not use
++this file except in compliance with the License.  You can obtain a copy
++in the file LICENSE in the source distribution or at
++L<https://www.openssl.org/source/license.html>.
++
++=cut
+diff --git a/doc/man1/openssl.pod b/doc/man1/openssl.pod
+index c67f8c68e7..4e364776a5 100644
+--- a/doc/man1/openssl.pod
++++ b/doc/man1/openssl.pod
+@@ -121,6 +121,10 @@ L<openssl-genpkey(1)> and L<openssl-pkeyparam(1)>.
+ 
+ EC (Elliptic curve) key processing.
+ 
++=item B<ech>
++
++Encrypted Client Hello (ECH) admin. See L<openssl-ech(1)>.
++
+ =item B<ecparam>
+ 
+ EC parameter manipulation and generation.
+diff --git a/doc/man3/SSL_CTX_set_options.pod b/doc/man3/SSL_CTX_set_options.pod
+index a6c922ecf9..50cbc896a6 100644
+--- a/doc/man3/SSL_CTX_set_options.pod
++++ b/doc/man3/SSL_CTX_set_options.pod
+@@ -362,6 +362,30 @@ only understands up to SSLv3. In this case the client must still use the
+ same SSLv3.1=TLSv1 announcement. Some clients step down to SSLv3 with respect
+ to the server's answer and violate the version rollback protection.)
+ 
++=item SSL_OP_ECH_GREASE
++
++If set, TLS ClientHello messages emitted by the client will include GREASE
++Encrypted ClientHello (ECH) extension values, if ECH is not really being
++attempted.
++
++=item SSL_OP_ECH_TRIALDECRYPT
++
++If set, servers will attempt to decrypt ECH extensions using all loaded
++ECH key pairs. By default, servers will only attempt decryption using
++an ECH key pair that matches the config_id in the ECH extension value
++received.
++
++=item SSL_OP_ECH_GREASE_RETRY_CONFIG
++
++If set, servers will add GREASEy ECHConfig values to those sent to the
++client after the client GREASEd or the client tried and failed to use
++ECH.
++
++=item SSL_OP_ECH_IGNORED_CID
++
++If set, TLS ClientHello messages emitted by the client will ignore the
++ECHConfig config_id chosen by the server and use a random octet.
++
+ =back
+ 
+ The following options no longer have any effect but their identifiers are
+diff --git a/doc/man3/SSL_set1_echstore.pod b/doc/man3/SSL_set1_echstore.pod
+new file mode 100644
+index 0000000000..0dd889b1ba
+--- /dev/null
++++ b/doc/man3/SSL_set1_echstore.pod
+@@ -0,0 +1,187 @@
++=pod
++
++=head1 NAME
++
++SSL_set1_echstore,
++OSSL_ECHSTORE_new, OSSL_ECHSTORE_free,
++OSSL_ECHSTORE_new_config, OSSL_ECHSTORE_write_pem,
++OSSL_ECHSTORE_read_echconfiglist, OSSL_ECHSTORE_get1_info,
++OSSL_ECHSTORE_downselect, OSSL_ECHSTORE_set1_key_and_read_pem,
++OSSL_ECHSTORE_read_pem, OSSL_ECHSTORE_num_keys, OSSL_ECHSTORE_flush_keys,
++OSSL_ECH_INFO_free, OSSL_ECH_INFO_print, SSL_CTX_set1_echstore,
++SSL_CTX_get1_echstore, SSL_get1_echstore, SSL_ech_set_server_names,
++SSL_ech_set_outer_server_name, SSL_ech_set_outer_alpn_protos,
++SSL_ech_get1_status, SSL_ech_set_grease_suite, SSL_ech_set_grease_type,
++SSL_ech_set_callback, SSL_ech_get_retry_config,
++SSL_CTX_ech_set_outer_alpn_protos, SSL_CTX_ech_raw_decrypt,
++SSL_CTX_ech_set_callback
++- Encrypted Client Hello (ECH) functions
++
++=head1 SYNOPSIS
++
++ #include <openssl/ech.h>
++
++  OSSL_ECHSTORE *OSSL_ECHSTORE_new(OSSL_LIB_CTX *libctx, const char *propq);
++  void OSSL_ECHSTORE_free(OSSL_ECHSTORE *es);
++  int OSSL_ECHSTORE_new_config(OSSL_ECHSTORE *es,
++                               uint16_t echversion, uint16_t max_name_length,
++                               const char *public_name, OSSL_HPKE_SUITE suite);
++  int OSSL_ECHSTORE_write_pem(OSSL_ECHSTORE *es, int index, BIO *out);
++  int OSSL_ECHSTORE_read_echconfiglist(OSSL_ECHSTORE *es, BIO *in);
++  int OSSL_ECHSTORE_get1_info(OSSL_ECHSTORE *es, OSSL_ECH_INFO **info,
++                              int *count);
++  int OSSL_ECHSTORE_downselect(OSSL_ECHSTORE *es, int index);
++  int OSSL_ECHSTORE_set1_key_and_read_pem(OSSL_ECHSTORE *es, EVP_PKEY *priv,
++                                          BIO *in, int for_retry);
++  int OSSL_ECHSTORE_read_pem(OSSL_ECHSTORE *es, BIO *in, int for_retry);
++  int OSSL_ECHSTORE_num_keys(OSSL_ECHSTORE *es, int *numkeys);
++  int OSSL_ECHSTORE_flush_keys(OSSL_ECHSTORE *es, time_t age);
++  void OSSL_ECH_INFO_free(OSSL_ECH_INFO *info, int count);
++  int OSSL_ECH_INFO_print(BIO *out, OSSL_ECH_INFO *info, int count);
++  int SSL_CTX_set1_echstore(SSL_CTX *ctx, OSSL_ECHSTORE *es);
++  int SSL_set1_echstore(SSL *s, OSSL_ECHSTORE *es);
++  OSSL_ECHSTORE *SSL_CTX_get1_echstore(const SSL_CTX *ctx);
++  OSSL_ECHSTORE *SSL_get1_echstore(const SSL *s);
++  int SSL_ech_set_server_names(SSL *s, const char *inner_name,
++                               const char *outer_name, int no_outer);
++  int SSL_ech_set_outer_server_name(SSL *s, const char *outer_name, int no_outer);
++  int SSL_ech_set_outer_alpn_protos(SSL *s, const unsigned char *protos,
++                                    const size_t protos_len);
++  int SSL_ech_get1_status(SSL *s, char **inner_sni, char **outer_sni);
++  int SSL_ech_set_grease_suite(SSL *s, const char *suite);
++  int SSL_ech_set_grease_type(SSL *s, uint16_t type);
++  void SSL_ech_set_callback(SSL *s, SSL_ech_cb_func f);
++  int SSL_ech_get_retry_config(SSL *s, unsigned char **ec, size_t *eclen);
++  int SSL_CTX_ech_set_outer_alpn_protos(SSL_CTX *s, const unsigned char *protos,
++                                        const size_t protos_len);
++  int SSL_CTX_ech_raw_decrypt(SSL_CTX *ctx,
++                              int *decrypted_ok,
++                              char **inner_sni, char **outer_sni,
++                              unsigned char *outer_ch, size_t outer_len,
++                              unsigned char *inner_ch, size_t *inner_len,
++                              unsigned char **hrrtok, size_t *toklen);
++  void SSL_CTX_ech_set_callback(SSL_CTX *ctx, SSL_ech_cb_func f);
++
++=head1 DESCRIPTION
++
++TODO(ECH): Text is TBD, this is just enough for the build.
++
++Mention SSL_set1_echstore() is a thing
++Mention OSSL_ECHSTORE_new() is a thing
++Mention OSSL_ECHSTORE_free() is a thing
++Mention OSSL_ECHSTORE_new_config() is a thing
++Mention OSSL_ECHSTORE_write_pem() is a thing
++Mention OSSL_ECHSTORE_read_echconfiglist() is a thing
++Mention OSSL_ECHSTORE_get1_info() is a thing
++Mention OSSL_ECHSTORE_downselect() is a thing
++Mention OSSL_ECHSTORE_set1_key_and_read_pem() is a thing
++Mention OSSL_ECHSTORE_read_pem() is a thing
++Mention OSSL_ECHSTORE_num_keys() is a thing
++Mention OSSL_ECHSTORE_flush_keys() is a thing
++Mention OSSL_ECH_INFO_free() is a thing
++Mention OSSL_ECH_INFO_print() is a thing
++Mention SSL_CTX_set1_echstore() is a thing
++Mention SSL_CTX_get1_echstore() is a thing
++Mention SSL_get1_echstore() is a thing
++Mention SSL_ech_set_server_names() is a thing
++Mention SSL_ech_set_outer_server_name() is a thing
++Mention SSL_ech_set_outer_alpn_protos() is a thing
++Mention SSL_ech_get1_status() is a thing
++Mention SSL_ech_set_grease_suite() is a thing
++Mention SSL_ech_set_grease_type() is a thing
++Mention SSL_ech_set_callback() is a thing
++Mention SSL_ech_get_retry_config() is a thing
++Mention SSL_CTX_ech_set_outer_alpn_protos() is a thing
++Mention SSL_CTX_ech_raw_decrypt() is a thing
++Mention SSL_CTX_ech_set_callback() is a thing
++
++=head2 Callback Function
++
++Applications can set a callback function that will be called when the
++outcome from an attempt at ECH has been determined. On the server,
++that happens early, as part of construction of the ServerHello message.
++On the client, the callback will happen after the SeverHello has
++been processed. In the event of HelloRetryRequest, the callback will
++only be triggered when processing the second ServerHello. The callback
++function will be triggered even if the client is only GREASEing.
++
++The callback function prototype is:
++
++ typedef unsigned int (*SSL_ech_cb_func)(SSL *s, const char *str);
++
++To set a callback function use SSL_ech_set_callback() or
++SSL_CTX_ech_set_callback() - the I<f> input should match the
++above prototype.
++
++When the callback function is called, the I<str> will point at a string
++intended for logging describing the state of ECH processing.
++Applications should not attempt to parse that string as the value depends
++on compile time settings, local configuration and the specific processing
++that happened prior to the callback. Applications that need to branch based
++on the outcome of ECH processing should instead make a call to
++SSL_ech_get1_status() from within their callback function.
++
++An example string I<str> as seen on a client might be:
++
++ ech_attempted=1
++ ech_attempted_type=0xfe0d
++ ech_atttempted_cid=0x5d
++ ech_done=1
++ ech_grease=0
++ ech_returned_len=0
++ ech_backend=0
++ ech_success=1
++ 2 ECHConfig values loaded
++ cfg(0): [fe0d,5d,cover.defo.ie,0020,[0001,0001],190984309c1a24cb944c005eb79d9c72ca9a4a979194b553dfd0bffc6b5c152d,00,00]
++ cfg(1): [fe0d,fd,cover.defo.ie,0020,[0001,0001],46dd4e2c81bb15ef9d194c99b86983844e2a1387e4fb7e7d3b8d368c8e1b4d2a,00,00]
++
++=head1 RETURN VALUES
++
++SSL_set1_echstore() returns zero on error
++OSSL_ECHSTORE_new() returns zero on error
++OSSL_ECHSTORE_free() returns zero on error
++OSSL_ECHSTORE_new_config() returns zero on error
++OSSL_ECHSTORE_write_pem() returns zero on error
++OSSL_ECHSTORE_read_echconfiglist() returns zero on error
++OSSL_ECHSTORE_get1_info() returns zero on error
++OSSL_ECHSTORE_downselect() returns zero on error
++OSSL_ECHSTORE_set1_key_and_read_pem() returns zero on error
++OSSL_ECHSTORE_read_pem() returns zero on error
++OSSL_ECHSTORE_num_keys() returns zero on error
++OSSL_ECHSTORE_flush_keys() returns zero on error
++OSSL_ECH_INFO_free() returns zero on error
++OSSL_ECH_INFO_print() returns zero on error
++SSL_CTX_set1_echstore() returns zero on error
++SSL_CTX_get1_echstore() returns zero on error
++SSL_get1_echstore() returns zero on error
++SSL_ech_set_server_names() returns zero on error
++SSL_ech_set_outer_server_name() returns zero on error
++SSL_ech_set_outer_alpn_protos() returns zero on error
++SSL_ech_get1_status() returns zero on error
++SSL_ech_set_grease_suite() returns zero on error
++SSL_ech_set_grease_type() returns zero on error
++SSL_ech_set_callback() returns zero on error
++SSL_ech_get_retry_config() returns zero on error
++SSL_CTX_ech_set_outer_alpn_protos() returns zero on error
++SSL_CTX_ech_raw_decrypt() returns zero on error
++SSL_CTX_ech_set_callback() returns zero on error
++
++=head1 SEE ALSO
++
++The Encrypted ClientHello specification: L<https://datatracker.ietf.org/doc/draft-ietf-tls-esni/>
++TODO(ECH) update link to RFC.
++
++=head1 HISTORY
++
++This functionality described here was added in OpenSSL 3.4.
++
++=head1 COPYRIGHT
++
++Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++
++Licensed under the Apache License 2.0 (the "License").  You may not use
++this file except in compliance with the License.  You can obtain a copy
++in the file LICENSE in the source distribution or at
++L<https://www.openssl.org/source/license.html>.
++
++=cut
+diff --git a/include/openssl/ech.h b/include/openssl/ech.h
+new file mode 100644
+index 0000000000..f79a1e9ae1
+--- /dev/null
++++ b/include/openssl/ech.h
+@@ -0,0 +1,137 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++/*
++ * Externally-visible data structures and prototypes for handling
++ * Encrypted ClientHello (ECH).
++ */
++#ifndef OPENSSL_ECH_H
++# define OPENSSL_ECH_H
++# pragma once
++
++# include <openssl/ssl.h>
++# include <openssl/hpke.h>
++
++# ifndef OPENSSL_NO_ECH
++
++/*
++ * Some externally visible limits - most used for sanity checks that could be
++ * bigger if needed, but that work for now
++ */
++#  define OSSL_ECH_MAX_PAYLOAD_LEN 1500 /* max ECH ciphertext to en/decode */
++#  define OSSL_ECH_MIN_ECHCONFIG_LEN 32 /* min for all encodings */
++#  define OSSL_ECH_MAX_ECHCONFIG_LEN 1500 /* max for all encodings */
++#  define OSSL_ECH_MAX_ECHCONFIGEXT_LEN 512 /* ECHConfig extension max */
++#  define OSSL_ECH_MAX_MAXNAMELEN 255 /* ECHConfig max for max name length */
++#  define OSSL_ECH_MAX_PUBLICNAME 255 /* max ECHConfig public name length */
++#  define OSSL_ECH_MAX_ALPNLEN 255 /* max alpn length */
++#  define OSSL_ECH_OUTERS_MAX 20 /* max extensions we compress via outer-exts */
++#  define OSSL_ECH_ALLEXTS_MAX 32 /* max total number of extension we allow */
++
++/*
++ * ECH version. We only support RFC XXXX as of now.  As/if new ECHConfig
++ * versions are added, those will be noted here.
++ * TODO(ECH): Replace XXXX with the actual RFC number once known.
++ */
++#  define OSSL_ECH_RFCXXXX_VERSION 0xfe0d /* official ECHConfig version */
++/* latest version from an RFC */
++#  define OSSL_ECH_CURRENT_VERSION OSSL_ECH_RFCXXXX_VERSION
++
++/* Return codes from SSL_ech_get1_status */
++#  define SSL_ECH_STATUS_BACKEND    4 /* ECH backend: saw an ech_is_inner */
++#  define SSL_ECH_STATUS_GREASE_ECH 3 /* GREASEd and got an ECH in return */
++#  define SSL_ECH_STATUS_GREASE     2 /* ECH GREASE happened  */
++#  define SSL_ECH_STATUS_SUCCESS    1 /* Success */
++#  define SSL_ECH_STATUS_FAILED     0 /* Some internal or protocol error */
++#  define SSL_ECH_STATUS_BAD_CALL   -100 /* Some in/out arguments were NULL */
++#  define SSL_ECH_STATUS_NOT_TRIED  -101 /* ECH wasn't attempted  */
++#  define SSL_ECH_STATUS_BAD_NAME   -102 /* ECH ok but server cert bad */
++#  define SSL_ECH_STATUS_NOT_CONFIGURED -103 /* ECH wasn't configured */
++#  define SSL_ECH_STATUS_FAILED_ECH -105 /* We tried, failed and got an ECH, from a good name */
++#  define SSL_ECH_STATUS_FAILED_ECH_BAD_NAME -106 /* We tried, failed and got an ECH, from a bad name */
++
++/* if a caller wants to index the last entry in the store */
++#  define OSSL_ECHSTORE_LAST -1
++
++/*
++ * Application-visible form of ECH information from the DNS, from config
++ * files, or from earlier API calls. APIs produce/process an array of these.
++ */
++typedef struct ossl_ech_info_st {
++    int index; /* externally re-usable reference to this value */
++    time_t seconds_in_memory; /* number of seconds since this was loaded */
++    char *public_name; /* public_name from API or ECHConfig */
++    char *inner_name; /* server-name (for inner CH if doing ECH) */
++    unsigned char *outer_alpns; /* outer ALPN string */
++    size_t outer_alpns_len;
++    unsigned char *inner_alpns; /* inner ALPN string */
++    size_t inner_alpns_len;
++    char *echconfig; /* a JSON-like version of the associated ECHConfig */
++} OSSL_ECH_INFO;
++
++/* Values for the for_retry inputs */
++#  define SSL_ECH_USE_FOR_RETRY 1
++#  define SSL_ECH_NOT_FOR_RETRY 0
++
++/*
++ * API calls built around OSSL_ECHSTORE
++ */
++OSSL_ECHSTORE *OSSL_ECHSTORE_new(OSSL_LIB_CTX *libctx, const char *propq);
++void OSSL_ECHSTORE_free(OSSL_ECHSTORE *es);
++int OSSL_ECHSTORE_new_config(OSSL_ECHSTORE *es,
++                             uint16_t echversion, uint8_t max_name_length,
++                             const char *public_name, OSSL_HPKE_SUITE suite);
++int OSSL_ECHSTORE_write_pem(OSSL_ECHSTORE *es, int index, BIO *out);
++int OSSL_ECHSTORE_read_echconfiglist(OSSL_ECHSTORE *es, BIO *in);
++int OSSL_ECHSTORE_get1_info(OSSL_ECHSTORE *es, OSSL_ECH_INFO **info,
++                            int *count);
++int OSSL_ECHSTORE_downselect(OSSL_ECHSTORE *es, int index);
++int OSSL_ECHSTORE_set1_key_and_read_pem(OSSL_ECHSTORE *es, EVP_PKEY *priv,
++                                        BIO *in, int for_retry);
++int OSSL_ECHSTORE_read_pem(OSSL_ECHSTORE *es, BIO *in, int for_retry);
++int OSSL_ECHSTORE_num_keys(OSSL_ECHSTORE *es, int *numkeys);
++int OSSL_ECHSTORE_flush_keys(OSSL_ECHSTORE *es, time_t age);
++
++void OSSL_ECH_INFO_free(OSSL_ECH_INFO *info, int count);
++int OSSL_ECH_INFO_print(BIO *out, OSSL_ECH_INFO *info, int count);
++
++/*
++ * APIs relating OSSL_ECHSTORE to SSL/SSL_CTX
++ */
++int SSL_CTX_set1_echstore(SSL_CTX *ctx, OSSL_ECHSTORE *es);
++int SSL_set1_echstore(SSL *s, OSSL_ECHSTORE *es);
++
++OSSL_ECHSTORE *SSL_CTX_get1_echstore(const SSL_CTX *ctx);
++OSSL_ECHSTORE *SSL_get1_echstore(const SSL *s);
++
++int SSL_ech_set_server_names(SSL *s, const char *inner_name,
++                             const char *outer_name, int no_outer);
++int SSL_ech_set_outer_server_name(SSL *s, const char *outer_name, int no_outer);
++int SSL_ech_set_outer_alpn_protos(SSL *s, const unsigned char *protos,
++                                  const size_t protos_len);
++
++int SSL_ech_get1_status(SSL *s, char **inner_sni, char **outer_sni);
++int SSL_ech_set_grease_suite(SSL *s, const char *suite);
++int SSL_ech_set_grease_type(SSL *s, uint16_t type);
++typedef unsigned int (*SSL_ech_cb_func)(SSL *s, const char *str);
++void SSL_ech_set_callback(SSL *s, SSL_ech_cb_func f);
++int SSL_ech_get_retry_config(SSL *s, unsigned char **ec, size_t *eclen);
++
++int SSL_CTX_ech_set_outer_alpn_protos(SSL_CTX *s, const unsigned char *protos,
++                                      const size_t protos_len);
++int SSL_CTX_ech_raw_decrypt(SSL_CTX *ctx,
++                            int *decrypted_ok,
++                            char **inner_sni, char **outer_sni,
++                            unsigned char *outer_ch, size_t outer_len,
++                            unsigned char *inner_ch, size_t *inner_len,
++                            unsigned char **hrrtok, size_t *toklen);
++void SSL_CTX_ech_set_callback(SSL_CTX *ctx, SSL_ech_cb_func f);
++
++# endif
++#endif
+diff --git a/include/openssl/pem.h b/include/openssl/pem.h
+index 6b7b66a2be..c0e0df03e8 100644
+--- a/include/openssl/pem.h
++++ b/include/openssl/pem.h
+@@ -59,6 +59,7 @@ extern "C" {
+ # define PEM_STRING_CMS          "CMS"
+ # define PEM_STRING_SM2PARAMETERS "SM2 PARAMETERS"
+ # define PEM_STRING_ACERT        "ATTRIBUTE CERTIFICATE"
++# define PEM_STRING_ECHCONFIG    "ECHCONFIG"
+ 
+ # define PEM_TYPE_ENCRYPTED      10
+ # define PEM_TYPE_MIC_ONLY       20
+diff --git a/include/openssl/ssl.h.in b/include/openssl/ssl.h.in
+index 5da1cde698..a8ccf6b8b8 100644
+--- a/include/openssl/ssl.h.in
++++ b/include/openssl/ssl.h.in
+@@ -44,6 +44,9 @@ use OpenSSL::stackhash qw(generate_stack_macros generate_const_stack_macros);
+ # include <openssl/ct.h>
+ # include <openssl/sslerr.h>
+ # include <openssl/prov_ssl.h>
++# ifndef OPENSSL_NO_ECH
++#  include <openssl/ech.h>
++# endif
+ # ifndef OPENSSL_NO_STDIO
+ #  include <stdio.h>
+ # endif
+@@ -426,6 +429,28 @@ typedef int (*SSL_async_callback_fn)(SSL *s, void *arg);
+ 
+ #define SSL_OP_PREFER_NO_DHE_KEX                         SSL_OP_BIT(35)
+ 
++
++#ifndef OPENSSL_NO_ECH
++/* Set this to tell client to emit greased ECH values */
++# define SSL_OP_ECH_GREASE                               SSL_OP_BIT(36)
++/*
++ * If this is set then the server side will attempt trial decryption
++ * of ECHs even if there is no matching ECH config_id. That's a bit
++ * inefficient, but more privacy friendly.
++ */
++# define SSL_OP_ECH_TRIALDECRYPT                         SSL_OP_BIT(37)
++/*
++ * If set, clients will ignore the supplied ECH config_id and replace
++ * that with a random value.
++ */
++# define SSL_OP_ECH_IGNORE_CID                           SSL_OP_BIT(38)
++/*
++ * If set, servers will add GREASEy ECHConfig values to those sent
++ * in retry_configs.
++ */
++# define SSL_OP_ECH_GREASE_RETRY_CONFIG                  SSL_OP_BIT(39)
++#endif
++
+ /*
+  * Option "collections."
+  */
+@@ -1191,6 +1216,9 @@ DECLARE_PEM_rw(SSL_SESSION, SSL_SESSION)
+ # define SSL_AD_NO_RENEGOTIATION         TLS1_AD_NO_RENEGOTIATION
+ # define SSL_AD_MISSING_EXTENSION        TLS13_AD_MISSING_EXTENSION
+ # define SSL_AD_CERTIFICATE_REQUIRED     TLS13_AD_CERTIFICATE_REQUIRED
++# ifndef OPENSSL_NO_ECH
++#  define SSL_AD_ECH_REQUIRED            TLS1_AD_ECH_REQUIRED
++# endif
+ # define SSL_AD_UNSUPPORTED_EXTENSION    TLS1_AD_UNSUPPORTED_EXTENSION
+ # define SSL_AD_CERTIFICATE_UNOBTAINABLE TLS1_AD_CERTIFICATE_UNOBTAINABLE
+ # define SSL_AD_UNRECOGNIZED_NAME        TLS1_AD_UNRECOGNIZED_NAME
+diff --git a/include/openssl/sslerr.h b/include/openssl/sslerr.h
+index d6ae547876..a626ae9734 100644
+--- a/include/openssl/sslerr.h
++++ b/include/openssl/sslerr.h
+@@ -112,6 +112,7 @@
+ # define SSL_R_DUPLICATE_COMPRESSION_ID                   309
+ # define SSL_R_ECC_CERT_NOT_FOR_SIGNING                   318
+ # define SSL_R_ECDH_REQUIRED_FOR_SUITEB_MODE              374
++# define SSL_R_ECH_REQUIRED                               420
+ # define SSL_R_EE_KEY_TOO_SMALL                           399
+ # define SSL_R_EMPTY_RAW_PUBLIC_KEY                       349
+ # define SSL_R_EMPTY_SRTP_PROTECTION_PROFILE_LIST         354
+diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
+index 8e9b110bb3..f30b224b29 100644
+--- a/include/openssl/tls1.h
++++ b/include/openssl/tls1.h
+@@ -78,6 +78,9 @@ extern "C" {
+ # define TLS1_AD_BAD_CERTIFICATE_HASH_VALUE 114
+ # define TLS1_AD_UNKNOWN_PSK_IDENTITY    115/* fatal */
+ # define TLS1_AD_NO_APPLICATION_PROTOCOL 120 /* fatal */
++# ifndef OPENSSL_NO_ECH
++#  define TLS1_AD_ECH_REQUIRED           121 /* fatal */
++# endif
+ 
+ /* ExtensionType values from RFC3546 / RFC4366 / RFC6066 */
+ # define TLSEXT_TYPE_server_name                 0
+@@ -168,6 +171,11 @@ extern "C" {
+ #  define TLSEXT_TYPE_next_proto_neg              13172
+ # endif
+ 
++# ifndef OPENSSL_NO_ECH
++#  define TLSEXT_TYPE_ech                       0xfe0d
++#  define TLSEXT_TYPE_outer_extensions          0xfd00
++# endif
++
+ /* NameType value from RFC3546 */
+ # define TLSEXT_NAMETYPE_host_name 0
+ /* status request value from RFC3546 */
+diff --git a/include/openssl/types.h b/include/openssl/types.h
+index e05a350f1d..cf32c552bf 100644
+--- a/include/openssl/types.h
++++ b/include/openssl/types.h
+@@ -238,6 +238,12 @@ typedef struct ossl_decoder_ctx_st OSSL_DECODER_CTX;
+ 
+ typedef struct ossl_self_test_st OSSL_SELF_TEST;
+ 
++#ifndef OPENSSL_NO_ECH
++/* opaque type for ECH related information */
++typedef struct ossl_echstore_st OSSL_ECHSTORE;
++#endif
++
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ssl/build.info b/ssl/build.info
+index adfc966379..6c29140346 100644
+--- a/ssl/build.info
++++ b/ssl/build.info
+@@ -20,6 +20,7 @@ SOURCE[../libssl]=\
+         bio_ssl.c ssl_err.c ssl_err_legacy.c tls_srp.c t1_trce.c ssl_utst.c \
+         statem/statem.c \
+         ssl_cert_comp.c \
++        ech.c \
+         tls_depr.c
+ 
+ # For shared builds we need to include the libcrypto packet.c and quic_vlint.c
+diff --git a/ssl/ech.c b/ssl/ech.c
+new file mode 100644
+index 0000000000..5b0d5878ef
+--- /dev/null
++++ b/ssl/ech.c
+@@ -0,0 +1,467 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++
++#include <openssl/ssl.h>
++#include <openssl/ech.h>
++#include "ssl_local.h"
++#include "ech_local.h"
++#include "statem/statem_local.h"
++#include <openssl/rand.h>
++#include <openssl/trace.h>
++#include <openssl/evp.h>
++#include <openssl/kdf.h>
++
++#ifndef OPENSSL_NO_ECH
++
++/* a size for some crypto vars */
++# define OSSL_ECH_CRYPTO_VAR_SIZE 2048
++
++/*
++ * @brief hash a buffer as a pretend file name being ascii-hex of hashed buffer
++ * @param es is the OSSL_ECHSTORE we're dealing with
++ * @param buf is the input buffer
++ * @param blen is the length of buf
++ * @param ah_hash is a pointer to where to put the result
++ * @param ah_len is the length of ah_hash
++ */
++static int ech_hash_pub_as_fname(OSSL_ECHSTORE *es,
++                                 const unsigned char *buf, size_t blen,
++                                 char *ah_hash, size_t ah_len)
++{
++    unsigned char hashval[EVP_MAX_MD_SIZE];
++    size_t hashlen, actual_ah_len;
++
++    if (es == NULL
++        || EVP_Q_digest(es->libctx, "SHA2-256", es->propq,
++                        buf, blen, hashval, &hashlen) != 1
++        || OPENSSL_buf2hexstr_ex(ah_hash, ah_len, &actual_ah_len,
++                                 hashval, hashlen, '\0') != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++    return 1;
++}
++
++/*
++ * API calls built around OSSL_ECHSTORE
++ */
++
++OSSL_ECHSTORE *OSSL_ECHSTORE_new(OSSL_LIB_CTX *libctx, const char *propq)
++{
++    OSSL_ECHSTORE *es = NULL;
++
++    es = OPENSSL_zalloc(sizeof(*es));
++    if (es == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++    es->libctx = libctx;
++    es->propq = propq;
++    return es;
++}
++
++static void ossl_echext_free(OSSL_ECHEXT *e)
++{
++    if (e == NULL)
++        return;
++    OPENSSL_free(e->val);
++    OPENSSL_free(e);
++    return;
++}
++
++static void ossl_echstore_entry_free(OSSL_ECHSTORE_ENTRY *ee)
++{
++    if (ee == NULL)
++        return;
++    OPENSSL_free(ee->public_name);
++    OPENSSL_free(ee->pub);
++    OPENSSL_free(ee->pemfname);
++    EVP_PKEY_free(ee->keyshare);
++    OPENSSL_free(ee->encoded);
++    OPENSSL_free(ee->suites);
++    sk_OSSL_ECHEXT_pop_free(ee->exts, ossl_echext_free);
++    OPENSSL_free(ee);
++    return;
++}
++
++void OSSL_ECHSTORE_free(OSSL_ECHSTORE *es)
++{
++    if (es == NULL)
++        return;
++    sk_OSSL_ECHSTORE_ENTRY_pop_free(es->entries, ossl_echstore_entry_free);
++    OPENSSL_free(es);
++    return;
++}
++
++int OSSL_ECHSTORE_new_config(OSSL_ECHSTORE *es,
++                             uint16_t echversion, uint8_t max_name_length,
++                             const char *public_name, OSSL_HPKE_SUITE suite)
++{
++    size_t pnlen = 0;
++    size_t publen = OSSL_ECH_CRYPTO_VAR_SIZE;
++    unsigned char pub[OSSL_ECH_CRYPTO_VAR_SIZE];
++    int rv = 0;
++    unsigned char *bp = NULL;
++    size_t bblen = 0;
++    EVP_PKEY *privp = NULL;
++    uint8_t config_id = 0;
++    WPACKET epkt;
++    BUF_MEM *epkt_mem = NULL;
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++    char pembuf[2 * EVP_MAX_MD_SIZE + 1];
++    size_t pembuflen = 2 * EVP_MAX_MD_SIZE + 1;
++
++    /* basic checks */
++    if (es == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    pnlen = (public_name == NULL ? 0 : strlen(public_name));
++    if (pnlen == 0 || pnlen > OSSL_ECH_MAX_PUBLICNAME
++        || max_name_length > OSSL_ECH_MAX_MAXNAMELEN) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    /* this used have more versions and will again in future */
++    switch (echversion) {
++    case OSSL_ECH_RFCXXXX_VERSION:
++        break;
++    default:
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++
++    /* so WPACKET_cleanup() won't go wrong */
++    memset(&epkt, 0, sizeof(epkt));
++    /* random config_id */
++    if (RAND_bytes_ex(es->libctx, (unsigned char *)&config_id, 1,
++                      RAND_DRBG_STRENGTH) <= 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    /* key pair */
++    if (OSSL_HPKE_keygen(suite, pub, &publen, &privp, NULL, 0,
++                         es->libctx, es->propq) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    /*
++     *   Reminder, for draft-13 we want this:
++     *
++     *   opaque HpkePublicKey<1..2^16-1>;
++     *   uint16 HpkeKemId;  // Defined in I-D.irtf-cfrg-hpke
++     *   uint16 HpkeKdfId;  // Defined in I-D.irtf-cfrg-hpke
++     *   uint16 HpkeAeadId; // Defined in I-D.irtf-cfrg-hpke
++     *   struct {
++     *       HpkeKdfId kdf_id;
++     *       HpkeAeadId aead_id;
++     *   } HpkeSymmetricCipherSuite;
++     *   struct {
++     *       uint8 config_id;
++     *       HpkeKemId kem_id;
++     *       HpkePublicKey public_key;
++     *       HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;
++     *   } HpkeKeyConfig;
++     *   struct {
++     *       HpkeKeyConfig key_config;
++     *       uint8 maximum_name_length;
++     *       opaque public_name<1..255>;
++     *       Extension extensions<0..2^16-1>;
++     *   } ECHConfigContents;
++     *   struct {
++     *       uint16 version;
++     *       uint16 length;
++     *       select (ECHConfig.version) {
++     *         case 0xfe0d: ECHConfigContents contents;
++     *       }
++     *   } ECHConfig;
++     *   ECHConfig ECHConfigList<1..2^16-1>;
++     */
++    if ((epkt_mem = BUF_MEM_new()) == NULL
++        || !BUF_MEM_grow(epkt_mem, OSSL_ECH_MAX_ECHCONFIG_LEN)) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    /* config id, KEM, public, KDF, AEAD, max name len, public_name, exts */
++    if (!WPACKET_init(&epkt, epkt_mem)
++        || (bp = WPACKET_get_curr(&epkt)) == NULL
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_put_bytes_u16(&epkt, echversion)
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_put_bytes_u8(&epkt, config_id)
++        || !WPACKET_put_bytes_u16(&epkt, suite.kem_id)
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_memcpy(&epkt, pub, publen)
++        || !WPACKET_close(&epkt)
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_put_bytes_u16(&epkt, suite.kdf_id)
++        || !WPACKET_put_bytes_u16(&epkt, suite.aead_id)
++        || !WPACKET_close(&epkt)
++        || !WPACKET_put_bytes_u8(&epkt, max_name_length)
++        || !WPACKET_start_sub_packet_u8(&epkt)
++        || !WPACKET_memcpy(&epkt, public_name, pnlen)
++        || !WPACKET_close(&epkt)
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_memcpy(&epkt, NULL, 0) /* no extensions */
++        || !WPACKET_close(&epkt)
++        || !WPACKET_close(&epkt)
++        || !WPACKET_close(&epkt)) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    /* bp, bblen has encoding */
++    WPACKET_get_total_written(&epkt, &bblen);
++    if ((ee = OPENSSL_zalloc(sizeof(*ee))) == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->suites = OPENSSL_malloc(sizeof(OSSL_HPKE_SUITE));
++    if (ee->suites == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    if (ech_hash_pub_as_fname(es, pub, publen, pembuf, pembuflen) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->version = echversion;
++    ee->pub_len = publen;
++    ee->pub = OPENSSL_memdup(pub, publen);
++    if (ee->pub == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->nsuites = 1;
++    ee->suites[0] = suite;
++    ee->public_name = OPENSSL_strdup(public_name);
++    if (ee->public_name == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->max_name_length = max_name_length;
++    ee->config_id = config_id;
++    ee->keyshare = privp;
++    ee->encoded = OPENSSL_memdup(bp, bblen);
++    if (ee->encoded == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->encoded_len = bblen;
++    ee->pemfname = OPENSSL_strdup(pembuf);
++    if (ee->pemfname == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->loadtime = time(0);
++    /* push entry into store */
++    if (es->entries == NULL)
++        es->entries = sk_OSSL_ECHSTORE_ENTRY_new_null();
++    if (es->entries == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    if (!sk_OSSL_ECHSTORE_ENTRY_push(es->entries, ee)) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    WPACKET_finish(&epkt);
++    BUF_MEM_free(epkt_mem);
++    return 1;
++
++err:
++    EVP_PKEY_free(privp);
++    WPACKET_cleanup(&epkt);
++    BUF_MEM_free(epkt_mem);
++    ossl_echstore_entry_free(ee);
++    OPENSSL_free(ee);
++    return rv;
++}
++
++int OSSL_ECHSTORE_write_pem(OSSL_ECHSTORE *es, int index, BIO *out)
++{
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++    int rv = 0, num = 0, chosen = 0;
++
++    if (es == NULL) {
++        /*
++         * TODO(ECH): this is a bit of a bogus error, just so as
++         * to get the `make update` command to add the required
++         * error number. We don't need it yet, but it's involved
++         * in some of the build artefacts, so may as well jump
++         * the gun a bit on it.
++         */
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_REQUIRED);
++        return 0;
++    }
++    num = sk_OSSL_ECHSTORE_ENTRY_num(es->entries);
++    if (num <= 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    if (index >= num) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    if (index == OSSL_ECHSTORE_LAST)
++        chosen = num - 1;
++    else
++        chosen = index;
++    ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, chosen);
++    if (ee == NULL || ee->keyshare == NULL || ee->encoded == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    /* private key first */
++    if (!PEM_write_bio_PrivateKey(out, ee->keyshare, NULL, NULL, 0,
++                                  NULL, NULL)) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    if (PEM_write_bio(out, PEM_STRING_ECHCONFIG, NULL,
++                      ee->encoded, ee->encoded_len) <= 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    rv = 1;
++err:
++    return rv;
++}
++
++int OSSL_ECHSTORE_read_echconfiglist(OSSL_ECHSTORE *es, BIO *in)
++{
++    return 0;
++}
++
++int OSSL_ECHSTORE_get1_info(OSSL_ECHSTORE *es, OSSL_ECH_INFO **info,
++                            int *count)
++{
++    return 0;
++}
++
++int OSSL_ECHSTORE_downselect(OSSL_ECHSTORE *es, int index)
++{
++    return 0;
++}
++
++int OSSL_ECHSTORE_set1_key_and_read_pem(OSSL_ECHSTORE *es, EVP_PKEY *priv,
++                                        BIO *in, int for_retry)
++{
++    return 0;
++}
++
++int OSSL_ECHSTORE_read_pem(OSSL_ECHSTORE *es, BIO *in, int for_retry)
++{
++    return 0;
++}
++
++int OSSL_ECHSTORE_num_keys(OSSL_ECHSTORE *es, int *numkeys)
++{
++    return 0;
++}
++
++int OSSL_ECHSTORE_flush_keys(OSSL_ECHSTORE *es, time_t age)
++{
++    return 0;
++}
++
++void OSSL_ECH_INFO_free(OSSL_ECH_INFO *info, int count)
++{
++    return;
++}
++
++int OSSL_ECH_INFO_print(BIO *out, OSSL_ECH_INFO *info, int count)
++{
++    return 0;
++}
++
++int SSL_CTX_set1_echstore(SSL_CTX *ctx, OSSL_ECHSTORE *es)
++{
++    return 0;
++}
++
++int SSL_set1_echstore(SSL *s, OSSL_ECHSTORE *es)
++{
++    return 0;
++}
++
++OSSL_ECHSTORE *SSL_CTX_get1_echstore(const SSL_CTX *ctx)
++{
++    return NULL;
++}
++
++OSSL_ECHSTORE *SSL_get1_echstore(const SSL *s)
++{
++    return NULL;
++}
++
++int SSL_ech_set_server_names(SSL *s, const char *inner_name,
++                             const char *outer_name, int no_outer)
++{
++    return 0;
++}
++
++int SSL_ech_set_outer_server_name(SSL *s, const char *outer_name, int no_outer)
++{
++    return 0;
++}
++
++int SSL_ech_set_outer_alpn_protos(SSL *s, const unsigned char *protos,
++                                  const size_t protos_len)
++{
++    return 0;
++}
++
++int SSL_ech_get1_status(SSL *s, char **inner_sni, char **outer_sni)
++{
++    return 0;
++}
++
++int SSL_ech_set_grease_suite(SSL *s, const char *suite)
++{
++    return 0;
++}
++
++int SSL_ech_set_grease_type(SSL *s, uint16_t type)
++{
++    return 0;
++}
++
++void SSL_ech_set_callback(SSL *s, SSL_ech_cb_func f)
++{
++    return;
++}
++
++int SSL_ech_get_retry_config(SSL *s, unsigned char **ec, size_t *eclen)
++{
++    return 0;
++}
++
++int SSL_CTX_ech_set_outer_alpn_protos(SSL_CTX *s, const unsigned char *protos,
++                                      const size_t protos_len)
++{
++    return 0;
++}
++
++int SSL_CTX_ech_raw_decrypt(SSL_CTX *ctx,
++                            int *decrypted_ok,
++                            char **inner_sni, char **outer_sni,
++                            unsigned char *outer_ch, size_t outer_len,
++                            unsigned char *inner_ch, size_t *inner_len,
++                            unsigned char **hrrtok, size_t *toklen)
++{
++    return 0;
++}
++
++void SSL_CTX_ech_set_callback(SSL_CTX *ctx, SSL_ech_cb_func f)
++{
++    return;
++}
++
++#endif
+diff --git a/ssl/ech_local.h b/ssl/ech_local.h
+new file mode 100644
+index 0000000000..125795fc2a
+--- /dev/null
++++ b/ssl/ech_local.h
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++/*
++ * Internal data structures and prototypes for handling
++ * Encrypted ClientHello (ECH)
++ */
++#ifndef OPENSSL_NO_ECH
++
++# ifndef HEADER_ECH_LOCAL_H
++#  define HEADER_ECH_LOCAL_H
++
++#  include <openssl/ssl.h>
++#  include <openssl/ech.h>
++#  include <openssl/hpke.h>
++
++/*
++ * Define this to get loads more lines of tracing which is
++ * very useful for interop.
++ * This needs tracing enabled at build time, e.g.:
++ *          $ ./config enable-ssl-trace enable-trace
++ * This added tracing will finally (mostly) disappear once the ECH RFC
++ * has issued, but is very useful for interop testing so some of it might
++ * be retained.
++ */
++#  define OSSL_ECH_SUPERVERBOSE
++
++/*
++ * Reminder of what goes in DNS for ECH RFC XXXX
++ *
++ *     opaque HpkePublicKey<1..2^16-1>;
++ *     uint16 HpkeKemId;  // Defined in I-D.irtf-cfrg-hpke
++ *     uint16 HpkeKdfId;  // Defined in I-D.irtf-cfrg-hpke
++ *     uint16 HpkeAeadId; // Defined in I-D.irtf-cfrg-hpke
++ *     struct {
++ *         HpkeKdfId kdf_id;
++ *         HpkeAeadId aead_id;
++ *     } HpkeSymmetricCipherSuite;
++ *     struct {
++ *         uint8 config_id;
++ *         HpkeKemId kem_id;
++ *         HpkePublicKey public_key;
++ *         HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;
++ *     } HpkeKeyConfig;
++ *     struct {
++ *         HpkeKeyConfig key_config;
++ *         uint8 maximum_name_length;
++ *         opaque public_name<1..255>;
++ *         Extension extensions<0..2^16-1>;
++ *     } ECHConfigContents;
++ *     struct {
++ *         uint16 version;
++ *         uint16 length;
++ *         select (ECHConfig.version) {
++ *           case 0xfe0d: ECHConfigContents contents;
++ *         }
++ *     } ECHConfig;
++ *     ECHConfig ECHConfigList<1..2^16-1>;
++ */
++
++typedef struct ossl_echext_st {
++    uint16_t type;
++    uint16_t len;
++    unsigned char *val;
++} OSSL_ECHEXT;
++
++DEFINE_STACK_OF(OSSL_ECHEXT)
++
++typedef struct ossl_echstore_entry_st {
++    uint16_t version; /* 0xff0d for draft-13 */
++    char *public_name;
++    size_t pub_len;
++    unsigned char *pub;
++    unsigned int nsuites;
++    OSSL_HPKE_SUITE *suites;
++    uint8_t max_name_length;
++    uint8_t config_id;
++    STACK_OF(OSSL_ECHEXT) *exts;
++    char *pemfname; /* name of PEM file from which this was loaded */
++    time_t loadtime; /* time public and private key were loaded from file */
++    EVP_PKEY *keyshare; /* long(ish) term ECH private keyshare on a server */
++    int for_retry; /* whether to use this ECHConfigList in a retry */
++    size_t encoded_len; /* length of overall encoded content */
++    unsigned char *encoded; /* overall encoded content */
++} OSSL_ECHSTORE_ENTRY;
++
++DEFINE_STACK_OF(OSSL_ECHSTORE_ENTRY)
++
++struct ossl_echstore_st {
++    STACK_OF(OSSL_ECHSTORE_ENTRY) *entries;
++    OSSL_LIB_CTX *libctx;
++    const char *propq;
++};
++
++# endif
++#endif
+diff --git a/ssl/ssl_err.c b/ssl/ssl_err.c
+index 3ef6afd03e..90a5172777 100644
+--- a/ssl/ssl_err.c
++++ b/ssl/ssl_err.c
+@@ -155,6 +155,7 @@ static const ERR_STRING_DATA SSL_str_reasons[] = {
+     "ecc cert not for signing"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ECDH_REQUIRED_FOR_SUITEB_MODE),
+     "ecdh required for suiteb mode"},
++    {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ECH_REQUIRED), "ech required"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EE_KEY_TOO_SMALL), "ee key too small"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EMPTY_RAW_PUBLIC_KEY),
+     "empty raw public key"},
+diff --git a/test/build.info b/test/build.info
+index ffb16c7775..03b3cdb401 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -64,7 +64,8 @@ IF[{- !$disabled{tests} -}]
+           ca_internals_test bio_tfo_test membio_test bio_dgram_test list_test \
+           fips_version_test x509_test hpke_test pairwise_fail_test \
+           nodefltctxtest evp_xof_test x509_load_cert_file_test bio_meth_test \
+-          x509_acert_test x509_req_test strtoultest bio_pw_callback_test
++          x509_acert_test x509_req_test strtoultest bio_pw_callback_test \
++          ech_test
+ 
+   IF[{- !$disabled{'rpk'} -}]
+     PROGRAMS{noinst}=rpktest
+@@ -209,6 +210,10 @@ IF[{- !$disabled{tests} -}]
+   INCLUDE[hpke_test]=../include ../apps/include
+   DEPEND[hpke_test]=../libcrypto.a libtestutil.a
+ 
++  SOURCE[ech_test]=ech_test.c helpers/ssltestlib.c filterprov.c tls-provider.c
++  INCLUDE[ech_test]=../include ../apps/include
++  DEPEND[ech_test]=../libssl.a ../libcrypto.a libtestutil.a
++
+   SOURCE[evp_extra_test2]=evp_extra_test2.c $INITSRC
+   INCLUDE[evp_extra_test2]=../include ../apps/include
+   DEPEND[evp_extra_test2]=../libcrypto libtestutil.a
+diff --git a/test/ech_test.c b/test/ech_test.c
+new file mode 100644
+index 0000000000..2e49b6b0c9
+--- /dev/null
++++ b/test/ech_test.c
+@@ -0,0 +1,66 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++#include <openssl/ssl.h>
++#include <openssl/hpke.h>
++#include "testutil.h"
++#include "helpers/ssltestlib.h"
++
++#ifndef OPENSSL_NO_ECH
++
++static int verbose = 0;
++
++typedef enum OPTION_choice {
++    OPT_ERR = -1,
++    OPT_EOF = 0,
++    OPT_VERBOSE,
++    OPT_TEST_ENUM
++} OPTION_CHOICE;
++
++const OPTIONS *test_get_options(void)
++{
++    static const OPTIONS test_options[] = {
++        OPT_TEST_OPTIONS_DEFAULT_USAGE,
++        { "v", OPT_VERBOSE, '-', "Enable verbose mode" },
++        { OPT_HELP_STR, 1, '-', "Run ECH tests\n" },
++        { NULL }
++    };
++    return test_options;
++}
++
++#endif
++
++int setup_tests(void)
++{
++#ifndef OPENSSL_NO_ECH
++    OPTION_CHOICE o;
++
++    while ((o = opt_next()) != OPT_EOF) {
++        switch (o) {
++        case OPT_VERBOSE:
++            verbose = 1;
++            break;
++        case OPT_TEST_CASES:
++            break;
++        default:
++            return 0;
++        }
++    }
++    /* TODO(ECH): we'll move test code over later */
++    return 1;
++#endif
++    return 1;
++}
++
++void cleanup_tests(void)
++{
++#ifndef OPENSSL_NO_ECH
++    ;
++#endif
++}
+diff --git a/test/recipes/30-test_ech.t b/test/recipes/30-test_ech.t
+new file mode 100644
+index 0000000000..73ecd2a9c6
+--- /dev/null
++++ b/test/recipes/30-test_ech.t
+@@ -0,0 +1,21 @@
++#! /usr/bin/env perl
++# Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright (c) 2022, Oracle and/or its affiliates.  All rights reserved.
++#
++# Licensed under the Apache License 2.0 (the "License").  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# https://www.openssl.org/source/license.html
++
++use strict;
++use OpenSSL::Test::Utils;
++use OpenSSL::Test qw/:DEFAULT srctop_file srctop_dir bldtop_dir bldtop_file/;
++
++setup("test_ech");
++
++plan skip_all => "ECH tests not supported in this build"
++    if disabled("ech") || disabled("tls1_3") || disabled("ec") || disabled("ecx");
++
++plan tests => 1;
++
++ok(run(test(["ech_test", srctop_dir("test", "certs")])))
+diff --git a/util/libssl.num b/util/libssl.num
+index f1daba1d1b..10160f79f5 100644
+--- a/util/libssl.num
++++ b/util/libssl.num
+@@ -587,3 +587,31 @@ SSL_CTX_flush_sessions_ex               587	3_4_0	EXIST::FUNCTION:
+ SSL_CTX_set_block_padding_ex            588	3_4_0	EXIST::FUNCTION:
+ SSL_set_block_padding_ex                589	3_4_0	EXIST::FUNCTION:
+ SSL_get1_builtin_sigalgs                590	3_4_0	EXIST::FUNCTION:
++OSSL_ECHSTORE_free                      ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_new_config                ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_write_pem                 ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_read_echconfiglist        ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_get1_info                 ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_downselect                ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_set1_key_and_read_pem     ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_read_pem                  ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_num_keys                  ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_flush_keys                ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECH_INFO_free                      ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECH_INFO_print                     ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_CTX_set1_echstore                   ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_set1_echstore                       ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_CTX_get1_echstore                   ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_get1_echstore                       ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_ech_set_server_names                ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_ech_set_outer_server_name           ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_ech_set_outer_alpn_protos           ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_ech_get1_status                     ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_ech_set_grease_suite                ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_ech_set_grease_type                 ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_ech_set_callback                    ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_ech_get_retry_config                ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_CTX_ech_set_outer_alpn_protos       ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_CTX_ech_raw_decrypt                 ?	3_5_0	EXIST::FUNCTION:ECH
++SSL_CTX_ech_set_callback                ?	3_5_0	EXIST::FUNCTION:ECH
++OSSL_ECHSTORE_new                       ?	3_5_0	EXIST::FUNCTION:ECH
+diff --git a/util/perl/TLSProxy/Message.pm b/util/perl/TLSProxy/Message.pm
+index 82db4022c2..9441a9035a 100644
+--- a/util/perl/TLSProxy/Message.pm
++++ b/util/perl/TLSProxy/Message.pm
+@@ -99,6 +99,8 @@ use constant {
+     EXT_RENEGOTIATE => 65281,
+     EXT_NPN => 13172,
+     EXT_CRYPTOPRO_BUG_EXTENSION => 0xfde8,
++    EXT_ECH => 0xfe0d,
++    EXT_ECH_OUTER => 0xfd00,
+     EXT_UNKNOWN => 0xfffe,
+     #Unknown extension that should appear last
+     EXT_FORCE_LAST => 0xffff
+-- 
+2.48.1
+

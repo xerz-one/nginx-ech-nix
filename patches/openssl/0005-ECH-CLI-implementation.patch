@@ -1,0 +1,4420 @@
+From 9e8986d01de8bcbfc3685d9d32c095dfd5e02950 Mon Sep 17 00:00:00 2001
+From: sftcd <stephen.farrell@cs.tcd.ie>
+Date: Wed, 11 Sep 2024 00:28:32 +0100
+Subject: [PATCH 5/6] ECH CLI implementation
+
+Reviewed-by: Tomas Mraz <tomas@openssl.org>
+Reviewed-by: Matt Caswell <matt@openssl.org>
+(Merged from https://github.com/openssl/openssl/pull/25420)
+---
+ apps/ech.c                     |  143 +++-
+ crypto/err/openssl.txt         |    2 +
+ doc/designs/ech-api.md         |    6 +-
+ doc/man1/openssl-ech.pod.in    |   41 +-
+ include/openssl/ech.h          |    7 +-
+ include/openssl/sslerr.h       |    2 +
+ ssl/build.info                 |    5 +-
+ ssl/ech.c                      |  467 -------------
+ ssl/ech/build.info             |    3 +
+ ssl/ech/ech_helper.c           |   15 +
+ ssl/ech/ech_internal.c         |   15 +
+ ssl/{ => ech}/ech_local.h      |    1 +
+ ssl/ech/ech_ssl_apis.c         |  106 +++
+ ssl/ech/ech_store.c            | 1168 ++++++++++++++++++++++++++++++++
+ ssl/ssl_err.c                  |  497 +++++++-------
+ test/certs/ech-big.pem         |   25 +
+ test/certs/ech-eg.pem          |    7 +
+ test/certs/ech-giant.pem       |   37 +
+ test/certs/ech-mid.pem         |   11 +
+ test/certs/ech-rsa.pem         |   14 +
+ test/ech_test.c                | 1006 ++++++++++++++++++++++++++-
+ test/recipes/20-test_app_ech.t |   93 +++
+ 22 files changed, 2912 insertions(+), 759 deletions(-)
+ delete mode 100644 ssl/ech.c
+ create mode 100644 ssl/ech/build.info
+ create mode 100644 ssl/ech/ech_helper.c
+ create mode 100644 ssl/ech/ech_internal.c
+ rename ssl/{ => ech}/ech_local.h (97%)
+ create mode 100644 ssl/ech/ech_ssl_apis.c
+ create mode 100644 ssl/ech/ech_store.c
+ create mode 100644 test/certs/ech-big.pem
+ create mode 100644 test/certs/ech-eg.pem
+ create mode 100644 test/certs/ech-giant.pem
+ create mode 100644 test/certs/ech-mid.pem
+ create mode 100644 test/certs/ech-rsa.pem
+ create mode 100644 test/recipes/20-test_app_ech.t
+
+diff --git a/apps/ech.c b/apps/ech.c
+index 06f123bca6..fa13ee6cf5 100644
+--- a/apps/ech.c
++++ b/apps/ech.c
+@@ -28,31 +28,35 @@
+ 
+ # define OSSL_ECH_KEYGEN_MODE    0 /* default: generate a key pair/ECHConfig */
+ # define OSSL_ECH_SELPRINT_MODE  1 /* we can print/down-select ECHConfigList */
+-
+-# define PEM_SELECT_ALL    -1 /* to indicate we're not downselecting another */
++# define OSSL_ECH_MAXINFILES     5 /* we'll only take this many inputs */
+ 
+ typedef enum OPTION_choice {
+     /* standard openssl options */
+-    OPT_ERR = -1, OPT_EOF = 0, OPT_HELP, OPT_VERBOSE,
+-    OPT_PEMOUT,
++    OPT_ERR = -1, OPT_EOF = 0, OPT_HELP, OPT_VERBOSE, OPT_TEXT,
++    OPT_OUT, OPT_IN,
+     /* ECHConfig specifics */
+     OPT_PUBLICNAME, OPT_ECHVERSION,
+-    OPT_MAXNAMELENGTH, OPT_HPKESUITE
++    OPT_MAXNAMELENGTH, OPT_HPKESUITE,
++    OPT_SELECT
+ } OPTION_CHOICE;
+ 
+ const OPTIONS ech_options[] = {
+     OPT_SECTION("General options"),
+     {"help", OPT_HELP, '-', "Display this summary"},
+     {"verbose", OPT_VERBOSE, '-', "Provide additional output"},
++    {"text", OPT_TEXT, '-', "Provide human-readable output"},
+     OPT_SECTION("Key generation"),
+-    {"pemout", OPT_PEMOUT, '>',
+-     "Private key and ECHConfig [default echconfig.pem]"},
++    {"out", OPT_OUT, '>',
++     "Private key and/or ECHConfig [default: echconfig.pem]"},
+     {"public_name", OPT_PUBLICNAME, 's', "public_name value"},
+     {"max_name_len", OPT_MAXNAMELENGTH, 'n',
+      "Maximum host name length value [default: 0]"},
+     {"suite", OPT_HPKESUITE, 's', "HPKE ciphersuite: e.g. \"0x20,1,3\""},
+     {"ech_version", OPT_ECHVERSION, 'n',
+-     "ECHConfig version [default 0xff0d (13)]"},
++     "ECHConfig version [default: 0xff0d (13)]"},
++    OPT_SECTION("ECH PEM file downselect/display"),
++    {"in", OPT_IN, '<', "An ECH PEM file"},
++    {"select", OPT_SELECT, 'n', "Downselect to the numbered ECH config"},
+     {NULL}
+ };
+ 
+@@ -66,9 +70,8 @@ static uint16_t verstr2us(char *arg)
+     long lv = strtol(arg, NULL, 0);
+     uint16_t rv = 0;
+ 
+-    if (lv < 0xffff && lv > 0) {
++    if (lv < 0xffff && lv > 0)
+         rv = (uint16_t)lv;
+-    }
+     return rv;
+ }
+ 
+@@ -76,14 +79,19 @@ int ech_main(int argc, char **argv)
+ {
+     char *prog = NULL;
+     OPTION_CHOICE o;
+-    int verbose = 0;
+-    char *pemfile = NULL;
++    int i, rv = 1, verbose = 0, text = 0, outsupp = 0;
++    int select = OSSL_ECHSTORE_ALL;
++    char *outfile = NULL, *infile = NULL;
++    char *infiles[OSSL_ECH_MAXINFILES] = { NULL };
++    int numinfiles = 0;
+     char *public_name = NULL;
+     char *suitestr = NULL;
+     uint16_t ech_version = OSSL_ECH_CURRENT_VERSION;
+     uint8_t max_name_length = 0;
+     OSSL_HPKE_SUITE hpke_suite = OSSL_HPKE_SUITE_DEFAULT;
+     int mode = OSSL_ECH_KEYGEN_MODE; /* key generation */
++    OSSL_ECHSTORE *es = NULL;
++    BIO *ecf = NULL;
+ 
+     prog = opt_init(argc, argv, ech_options);
+     while ((o = opt_next()) != OPT_EOF) {
+@@ -94,12 +102,32 @@ int ech_main(int argc, char **argv)
+             goto end;
+         case OPT_HELP:
+             opt_help(ech_options);
++            rv = 0;
+             goto end;
+         case OPT_VERBOSE:
+             verbose = 1;
+             break;
+-        case OPT_PEMOUT:
+-            pemfile = opt_arg();
++        case OPT_TEXT:
++            text = 1;
++            break;
++        case OPT_SELECT:
++            mode = OSSL_ECH_SELPRINT_MODE;
++            select = strtol(opt_arg(), NULL, 10);
++            break;
++        case OPT_OUT:
++            outfile = opt_arg();
++            outsupp = 1;
++            break;
++        case OPT_IN:
++            mode = OSSL_ECH_SELPRINT_MODE;
++            infile = opt_arg();
++            if (numinfiles >= OSSL_ECH_MAXINFILES) {
++                BIO_printf(bio_err, "too many input files, only %d allowed\n",
++                           OSSL_ECH_MAXINFILES);
++                goto opthelp;
++            }
++            infiles[numinfiles] = infile;
++            numinfiles++;
+             break;
+         case OPT_PUBLICNAME:
+             public_name = opt_arg();
+@@ -147,10 +175,10 @@ int ech_main(int argc, char **argv)
+         goto end;
+     }
+ 
+-    if (max_name_length > TLSEXT_MAXLEN_host_name) {
++    if (max_name_length > OSSL_ECH_MAX_MAXNAMELEN) {
+         BIO_printf(bio_err, "Weird max name length (0x%04x) - biggest is "
+                    "(0x%04x) - exiting\n", max_name_length,
+-                   TLSEXT_MAXLEN_host_name);
++                   OSSL_ECH_MAX_MAXNAMELEN);
+         ERR_print_errors(bio_err);
+         goto end;
+     }
+@@ -164,17 +192,15 @@ int ech_main(int argc, char **argv)
+     }
+ 
+     /* Set default if needed */
+-    if (pemfile == NULL)
+-        pemfile = "echconfig.pem";
+-
++    if (outfile == NULL)
++        outfile = "echconfig.pem";
++    es = OSSL_ECHSTORE_new(NULL, NULL);
++    if (es == NULL)
++        goto end;
+     if (mode == OSSL_ECH_KEYGEN_MODE) {
+-        OSSL_ECHSTORE *es = NULL;
+-        BIO *ecf = NULL;
+-
+         if (verbose)
+             BIO_printf(bio_err, "Calling OSSL_ECHSTORE_new_config\n");
+-        if ((ecf = BIO_new_file(pemfile, "w")) == NULL 
+-            || (es = OSSL_ECHSTORE_new(NULL, NULL)) == NULL
++        if ((ecf = BIO_new_file(outfile, "w")) == NULL
+             || OSSL_ECHSTORE_new_config(es, ech_version, max_name_length,
+                                         public_name, hpke_suite) != 1
+             || OSSL_ECHSTORE_write_pem(es, 0, ecf) != 1) {
+@@ -183,17 +209,72 @@ int ech_main(int argc, char **argv)
+         }
+         if (verbose)
+             BIO_printf(bio_err, "OSSL_ECHSTORE_new_config success\n");
+-        OSSL_ECHSTORE_free(es);
+-        BIO_free_all(ecf);
+-        return 1;
++        rv = 0;
+     }
+ 
+-opthelp:
+-    BIO_printf(bio_err, "%s: Use -help for summary.\n", prog);
+-    goto end;
++    if (mode == OSSL_ECH_SELPRINT_MODE) {
++        if (numinfiles == 0)
++            goto opthelp;
++        for (i = 0; i != numinfiles; i++) {
++            if ((ecf = BIO_new_file(infiles[i], "r")) == NULL
++                || OSSL_ECHSTORE_read_pem(es, ecf, OSSL_ECH_FOR_RETRY) != 1) {
++                if (verbose)
++                    BIO_printf(bio_err, "OSSL_ECHSTORE_read_pem error for %s\n",
++                               infiles[i]);
++                /* try read it as an ECHConfigList */
++                goto end;
++            }
++            BIO_free(ecf);
++            ecf = NULL;
++        }
++        if (verbose)
++            BIO_printf(bio_err, "Success reading %d files\n", numinfiles);
++        if (outsupp == 1) {
++            /* write result to that, with downselection if required */
++            if (verbose)
++                BIO_printf(bio_err, "Will write to %s\n", outfile);
++            if (verbose && select != OSSL_ECHSTORE_ALL)
++                BIO_printf(bio_err, "Selected entry: %d\n", select);
++            if ((ecf = BIO_new_file(outfile, "w")) == NULL
++                || OSSL_ECHSTORE_write_pem(es, select, ecf) != 1) {
++                BIO_printf(bio_err, "OSSL_ECHSTORE_write_pem error\n");
++                goto end;
++            }
++            if (verbose)
++                BIO_printf(bio_err, "Success writing to %s\n", outfile);
++        }
++        rv = 0;
++    }
++
++    if (text) {
++        OSSL_ECH_INFO *oi = NULL;
++        int oi_ind, oi_cnt = 0;
++
++        if (OSSL_ECHSTORE_get1_info(es, &oi, &oi_cnt) != 1)
++            goto end;
++        if (verbose)
++            BIO_printf(bio_err, "Printing %d ECHConfigList\n", oi_cnt);
++        for (oi_ind = 0; oi_ind != oi_cnt; oi_ind++) {
++            if (OSSL_ECH_INFO_print(bio_out, oi, oi_ind) != 1) {
++                BIO_printf(bio_err, "OSSL_ECH_INFO_print error entry (%d)\n",
++                           oi_ind);
++                goto end;
++            }
++        }
++        OSSL_ECH_INFO_free(oi, oi_cnt);
++        if (verbose)
++            BIO_printf(bio_err, "Success printing %d ECHConfigList\n", oi_cnt);
++        rv = 0;
++    }
+ 
+ end:
+-    return 0;
++    OSSL_ECHSTORE_free(es);
++    BIO_free_all(ecf);
++    return rv;
++opthelp:
++    BIO_printf(bio_err, "%s: Use -help for summary.\n", prog);
++    BIO_printf(bio_err, "\tup to %d -in instances allowed\n", OSSL_ECH_MAXINFILES);
++    return rv;
+ }
+ 
+ #endif
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index ecc29e4533..90740f7297 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -1340,6 +1340,7 @@ SSL_R_BAD_DH_VALUE:102:bad dh value
+ SSL_R_BAD_DIGEST_LENGTH:111:bad digest length
+ SSL_R_BAD_EARLY_DATA:233:bad early data
+ SSL_R_BAD_ECC_CERT:304:bad ecc cert
++SSL_R_BAD_ECHCONFIG_EXTENSION:422:bad echconfig extension
+ SSL_R_BAD_ECPOINT:306:bad ecpoint
+ SSL_R_BAD_EXTENSION:110:bad extension
+ SSL_R_BAD_HANDSHAKE_LENGTH:332:bad handshake length
+@@ -1419,6 +1420,7 @@ SSL_R_DTLS_MESSAGE_TOO_BIG:334:dtls message too big
+ SSL_R_DUPLICATE_COMPRESSION_ID:309:duplicate compression id
+ SSL_R_ECC_CERT_NOT_FOR_SIGNING:318:ecc cert not for signing
+ SSL_R_ECDH_REQUIRED_FOR_SUITEB_MODE:374:ecdh required for suiteb mode
++SSL_R_ECH_DECODE_ERROR:423:ech decode error
+ SSL_R_ECH_REQUIRED:421:ech required
+ SSL_R_EE_KEY_TOO_SMALL:399:ee key too small
+ SSL_R_EMPTY_RAW_PUBLIC_KEY:349:empty raw public key
+diff --git a/doc/designs/ech-api.md b/doc/designs/ech-api.md
+index eb78bbc25d..a7f1ffdbd0 100644
+--- a/doc/designs/ech-api.md
++++ b/doc/designs/ech-api.md
+@@ -205,6 +205,8 @@ typedef struct ossl_echstore_st OSSL_ECHSTORE;
+ 
+ /* if a caller wants to index the last entry in the store */
+ # define OSSL_ECHSTORE_LAST -1
++/* if a caller wants all entries in the store, e.g. to print public values */
++#  define OSSL_ECHSTORE_ALL -2
+ 
+ OSSL_ECHSTORE *OSSL_ECHSTORE_new(OSSL_LIB_CTX *libctx, const char *propq);
+ void OSSL_ECHSTORE_free(OSSL_ECHSTORE *es);
+@@ -234,7 +236,8 @@ value and the related "singleton" ECHConfigList structure.
+ structure (conforming to the [PEMECH
+ specification](https://datatracker.ietf.org/doc/draft-farrell-tls-pemesni/))
+ from the `OSSL_ECHSTORE` entry identified by the `index`. (An `index` of
+-`OSSL_ECHSTORE_LAST` will select the last entry.)
++`OSSL_ECHSTORE_LAST` will select the last entry. An `index` of
++`OSSL_ECHSTORE_ALL` will output all public values, and no private values.)
+ These two APIs will typically be used via the `openssl ech` command line tool.
+ 
+ `OSSL_ECHSTORE_read_echconfiglist()` will typically be used by a client to
+@@ -323,6 +326,7 @@ typedef struct ossl_ech_info_st {
+     unsigned char *inner_alpns; /* inner ALPN string */
+     size_t inner_alpns_len;
+     char *echconfig; /* a JSON-like version of the associated ECHConfig */
++    int has_private_key; /* 0 if we don't have a related private key */
+ } OSSL_ECH_INFO;
+ 
+ void OSSL_ECH_INFO_free(OSSL_ECH_INFO *info, int count);
+diff --git a/doc/man1/openssl-ech.pod.in b/doc/man1/openssl-ech.pod.in
+index b7736d4b96..c894feee1f 100644
+--- a/doc/man1/openssl-ech.pod.in
++++ b/doc/man1/openssl-ech.pod.in
+@@ -10,24 +10,30 @@ openssl-ech - ECH key generation
+ B<openssl> B<ech>
+ [B<-help>]
+ [B<-verbose>]
+-[B<-pemout> I<file>]
++[B<-in> I<files>]
++[B<-out> I<file>]
+ [B<-public_name> I<name>]
+ [B<-max_name_len> I<len>]
+ [B<-suite> I<suite_str>]
+ [B<-ech_version> I<version>]
++[B<-select> I<number>]
++[B<-text>]
+ 
+ =head1 DESCRIPTION
+ 
+-The L<openssl-ech(1)> command generates Encrypted Client Hello (ECH) private keys 
+-and public keys in the ECHConfig format.
++The L<openssl-ech(1)> command generates Encrypted Client Hello (ECH) key pairs
++in the ECHConfig PEM file format as specified in
++L<https://datatracker.ietf.org/doc/draft-farrell-tls-pemesni/>.
++TODO(ECH): update I-D reference to RFC when possible.
+ 
+-The "ECHConfig PEM file" format mentioned below is specified in
+-L<https://datatracker.ietf.org/doc/draft-farrell-tls-pemesni/> and consists of
+-one private key in PKCS#8 format and a base64 encoded ECHConfig containing one
+-matching public value.
++That format consists of an optional private key in PKCS#8 format and a base64
++encoded ECHConfigList containing an entry with a matching public value (and
++possibly other entries as well).
+ 
+ =head1 OPTIONS
+ 
++The following options are supported:
++
+ =over 4
+ 
+ =item B<-help>
+@@ -38,9 +44,21 @@ Print out a usage message.
+ 
+ Print more verbosely.
+ 
+-=item B<-pemout> I<file> 
++=item B<-in>
++
++Provide an input ECH PEM file for printing or merging. Up to five
++input files can be provided via use of multiple B<in> arguments.
++
++=item B<-out> I<file>
++
++Name of output ECHConfig PEM file.  If a new key pair was generated the output
++file will contain the private key and encoded ECHConfigList.  If one or more
++input files was provided the output file will contain a set of ECHConfigList
++values with public keys from the inputs, and no private key(s).
+ 
+-Name of output ECHConfig PEM file.
++=item B<-text>
++
++Provide human-readable text ouput.
+ 
+ =item B<-public_name> I<name>
+ 
+@@ -58,6 +76,11 @@ HPKE suite to use in the ECHConfig.
+ 
+ The ECH version to use in the ECHConfig. Only 0xfe0d is supported in this version.
+ 
++=item B<-select> I<number>
++
++Select the N-th ECHConfig/public key from the set of input ECH PEM files and output
++that.
++
+ =back
+ 
+ =head1 NOTES
+diff --git a/include/openssl/ech.h b/include/openssl/ech.h
+index f79a1e9ae1..95705fc921 100644
+--- a/include/openssl/ech.h
++++ b/include/openssl/ech.h
+@@ -58,6 +58,8 @@
+ 
+ /* if a caller wants to index the last entry in the store */
+ #  define OSSL_ECHSTORE_LAST -1
++/* if a caller wants all entries in the store, e.g. to print public values */
++#  define OSSL_ECHSTORE_ALL -2
+ 
+ /*
+  * Application-visible form of ECH information from the DNS, from config
+@@ -73,11 +75,12 @@ typedef struct ossl_ech_info_st {
+     unsigned char *inner_alpns; /* inner ALPN string */
+     size_t inner_alpns_len;
+     char *echconfig; /* a JSON-like version of the associated ECHConfig */
++    int has_private_key; /* 0 if we don't have a related private key */
+ } OSSL_ECH_INFO;
+ 
+ /* Values for the for_retry inputs */
+-#  define SSL_ECH_USE_FOR_RETRY 1
+-#  define SSL_ECH_NOT_FOR_RETRY 0
++#  define OSSL_ECH_FOR_RETRY 1
++#  define OSSL_ECH_NO_RETRY  0
+ 
+ /*
+  * API calls built around OSSL_ECHSTORE
+diff --git a/include/openssl/sslerr.h b/include/openssl/sslerr.h
+index b252e8084d..fafb7bb0b6 100644
+--- a/include/openssl/sslerr.h
++++ b/include/openssl/sslerr.h
+@@ -36,6 +36,7 @@
+ # define SSL_R_BAD_DIGEST_LENGTH                          111
+ # define SSL_R_BAD_EARLY_DATA                             233
+ # define SSL_R_BAD_ECC_CERT                               304
++# define SSL_R_BAD_ECHCONFIG_EXTENSION                    422
+ # define SSL_R_BAD_ECPOINT                                306
+ # define SSL_R_BAD_EXTENSION                              110
+ # define SSL_R_BAD_HANDSHAKE_LENGTH                       332
+@@ -112,6 +113,7 @@
+ # define SSL_R_DUPLICATE_COMPRESSION_ID                   309
+ # define SSL_R_ECC_CERT_NOT_FOR_SIGNING                   318
+ # define SSL_R_ECDH_REQUIRED_FOR_SUITEB_MODE              374
++# define SSL_R_ECH_DECODE_ERROR                           423
+ # define SSL_R_ECH_REQUIRED                               421
+ # define SSL_R_EE_KEY_TOO_SMALL                           399
+ # define SSL_R_EMPTY_RAW_PUBLIC_KEY                       349
+diff --git a/ssl/build.info b/ssl/build.info
+index 6c29140346..b6c6d74117 100644
+--- a/ssl/build.info
++++ b/ssl/build.info
+@@ -6,6 +6,10 @@ IF[{- !$disabled{quic} -}]
+   SUBDIRS=quic
+ ENDIF
+ 
++IF[{- !$disabled{ech} -}]
++  SUBDIRS=ech
++ENDIF
++
+ SOURCE[../libssl]=\
+         pqueue.c \
+         statem/statem_srvr.c statem/statem_clnt.c  s3_lib.c  s3_enc.c \
+@@ -20,7 +24,6 @@ SOURCE[../libssl]=\
+         bio_ssl.c ssl_err.c ssl_err_legacy.c tls_srp.c t1_trce.c ssl_utst.c \
+         statem/statem.c \
+         ssl_cert_comp.c \
+-        ech.c \
+         tls_depr.c
+ 
+ # For shared builds we need to include the libcrypto packet.c and quic_vlint.c
+diff --git a/ssl/ech.c b/ssl/ech.c
+deleted file mode 100644
+index 5b0d5878ef..0000000000
+--- a/ssl/ech.c
++++ /dev/null
+@@ -1,467 +0,0 @@
+-/*
+- * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
+- *
+- * Licensed under the OpenSSL license (the "License").  You may not use
+- * this file except in compliance with the License.  You can obtain a copy
+- * in the file LICENSE in the source distribution or at
+- * https://www.openssl.org/source/license.html
+- */
+-
+-
+-#include <openssl/ssl.h>
+-#include <openssl/ech.h>
+-#include "ssl_local.h"
+-#include "ech_local.h"
+-#include "statem/statem_local.h"
+-#include <openssl/rand.h>
+-#include <openssl/trace.h>
+-#include <openssl/evp.h>
+-#include <openssl/kdf.h>
+-
+-#ifndef OPENSSL_NO_ECH
+-
+-/* a size for some crypto vars */
+-# define OSSL_ECH_CRYPTO_VAR_SIZE 2048
+-
+-/*
+- * @brief hash a buffer as a pretend file name being ascii-hex of hashed buffer
+- * @param es is the OSSL_ECHSTORE we're dealing with
+- * @param buf is the input buffer
+- * @param blen is the length of buf
+- * @param ah_hash is a pointer to where to put the result
+- * @param ah_len is the length of ah_hash
+- */
+-static int ech_hash_pub_as_fname(OSSL_ECHSTORE *es,
+-                                 const unsigned char *buf, size_t blen,
+-                                 char *ah_hash, size_t ah_len)
+-{
+-    unsigned char hashval[EVP_MAX_MD_SIZE];
+-    size_t hashlen, actual_ah_len;
+-
+-    if (es == NULL
+-        || EVP_Q_digest(es->libctx, "SHA2-256", es->propq,
+-                        buf, blen, hashval, &hashlen) != 1
+-        || OPENSSL_buf2hexstr_ex(ah_hash, ah_len, &actual_ah_len,
+-                                 hashval, hashlen, '\0') != 1) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        return 0;
+-    }
+-    return 1;
+-}
+-
+-/*
+- * API calls built around OSSL_ECHSTORE
+- */
+-
+-OSSL_ECHSTORE *OSSL_ECHSTORE_new(OSSL_LIB_CTX *libctx, const char *propq)
+-{
+-    OSSL_ECHSTORE *es = NULL;
+-
+-    es = OPENSSL_zalloc(sizeof(*es));
+-    if (es == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        return 0;
+-    }
+-    es->libctx = libctx;
+-    es->propq = propq;
+-    return es;
+-}
+-
+-static void ossl_echext_free(OSSL_ECHEXT *e)
+-{
+-    if (e == NULL)
+-        return;
+-    OPENSSL_free(e->val);
+-    OPENSSL_free(e);
+-    return;
+-}
+-
+-static void ossl_echstore_entry_free(OSSL_ECHSTORE_ENTRY *ee)
+-{
+-    if (ee == NULL)
+-        return;
+-    OPENSSL_free(ee->public_name);
+-    OPENSSL_free(ee->pub);
+-    OPENSSL_free(ee->pemfname);
+-    EVP_PKEY_free(ee->keyshare);
+-    OPENSSL_free(ee->encoded);
+-    OPENSSL_free(ee->suites);
+-    sk_OSSL_ECHEXT_pop_free(ee->exts, ossl_echext_free);
+-    OPENSSL_free(ee);
+-    return;
+-}
+-
+-void OSSL_ECHSTORE_free(OSSL_ECHSTORE *es)
+-{
+-    if (es == NULL)
+-        return;
+-    sk_OSSL_ECHSTORE_ENTRY_pop_free(es->entries, ossl_echstore_entry_free);
+-    OPENSSL_free(es);
+-    return;
+-}
+-
+-int OSSL_ECHSTORE_new_config(OSSL_ECHSTORE *es,
+-                             uint16_t echversion, uint8_t max_name_length,
+-                             const char *public_name, OSSL_HPKE_SUITE suite)
+-{
+-    size_t pnlen = 0;
+-    size_t publen = OSSL_ECH_CRYPTO_VAR_SIZE;
+-    unsigned char pub[OSSL_ECH_CRYPTO_VAR_SIZE];
+-    int rv = 0;
+-    unsigned char *bp = NULL;
+-    size_t bblen = 0;
+-    EVP_PKEY *privp = NULL;
+-    uint8_t config_id = 0;
+-    WPACKET epkt;
+-    BUF_MEM *epkt_mem = NULL;
+-    OSSL_ECHSTORE_ENTRY *ee = NULL;
+-    char pembuf[2 * EVP_MAX_MD_SIZE + 1];
+-    size_t pembuflen = 2 * EVP_MAX_MD_SIZE + 1;
+-
+-    /* basic checks */
+-    if (es == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
+-        return 0;
+-    }
+-    pnlen = (public_name == NULL ? 0 : strlen(public_name));
+-    if (pnlen == 0 || pnlen > OSSL_ECH_MAX_PUBLICNAME
+-        || max_name_length > OSSL_ECH_MAX_MAXNAMELEN) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
+-        return 0;
+-    }
+-    /* this used have more versions and will again in future */
+-    switch (echversion) {
+-    case OSSL_ECH_RFCXXXX_VERSION:
+-        break;
+-    default:
+-        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
+-        return 0;
+-    }
+-
+-    /* so WPACKET_cleanup() won't go wrong */
+-    memset(&epkt, 0, sizeof(epkt));
+-    /* random config_id */
+-    if (RAND_bytes_ex(es->libctx, (unsigned char *)&config_id, 1,
+-                      RAND_DRBG_STRENGTH) <= 0) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    /* key pair */
+-    if (OSSL_HPKE_keygen(suite, pub, &publen, &privp, NULL, 0,
+-                         es->libctx, es->propq) != 1) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    /*
+-     *   Reminder, for draft-13 we want this:
+-     *
+-     *   opaque HpkePublicKey<1..2^16-1>;
+-     *   uint16 HpkeKemId;  // Defined in I-D.irtf-cfrg-hpke
+-     *   uint16 HpkeKdfId;  // Defined in I-D.irtf-cfrg-hpke
+-     *   uint16 HpkeAeadId; // Defined in I-D.irtf-cfrg-hpke
+-     *   struct {
+-     *       HpkeKdfId kdf_id;
+-     *       HpkeAeadId aead_id;
+-     *   } HpkeSymmetricCipherSuite;
+-     *   struct {
+-     *       uint8 config_id;
+-     *       HpkeKemId kem_id;
+-     *       HpkePublicKey public_key;
+-     *       HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;
+-     *   } HpkeKeyConfig;
+-     *   struct {
+-     *       HpkeKeyConfig key_config;
+-     *       uint8 maximum_name_length;
+-     *       opaque public_name<1..255>;
+-     *       Extension extensions<0..2^16-1>;
+-     *   } ECHConfigContents;
+-     *   struct {
+-     *       uint16 version;
+-     *       uint16 length;
+-     *       select (ECHConfig.version) {
+-     *         case 0xfe0d: ECHConfigContents contents;
+-     *       }
+-     *   } ECHConfig;
+-     *   ECHConfig ECHConfigList<1..2^16-1>;
+-     */
+-    if ((epkt_mem = BUF_MEM_new()) == NULL
+-        || !BUF_MEM_grow(epkt_mem, OSSL_ECH_MAX_ECHCONFIG_LEN)) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    /* config id, KEM, public, KDF, AEAD, max name len, public_name, exts */
+-    if (!WPACKET_init(&epkt, epkt_mem)
+-        || (bp = WPACKET_get_curr(&epkt)) == NULL
+-        || !WPACKET_start_sub_packet_u16(&epkt)
+-        || !WPACKET_put_bytes_u16(&epkt, echversion)
+-        || !WPACKET_start_sub_packet_u16(&epkt)
+-        || !WPACKET_put_bytes_u8(&epkt, config_id)
+-        || !WPACKET_put_bytes_u16(&epkt, suite.kem_id)
+-        || !WPACKET_start_sub_packet_u16(&epkt)
+-        || !WPACKET_memcpy(&epkt, pub, publen)
+-        || !WPACKET_close(&epkt)
+-        || !WPACKET_start_sub_packet_u16(&epkt)
+-        || !WPACKET_put_bytes_u16(&epkt, suite.kdf_id)
+-        || !WPACKET_put_bytes_u16(&epkt, suite.aead_id)
+-        || !WPACKET_close(&epkt)
+-        || !WPACKET_put_bytes_u8(&epkt, max_name_length)
+-        || !WPACKET_start_sub_packet_u8(&epkt)
+-        || !WPACKET_memcpy(&epkt, public_name, pnlen)
+-        || !WPACKET_close(&epkt)
+-        || !WPACKET_start_sub_packet_u16(&epkt)
+-        || !WPACKET_memcpy(&epkt, NULL, 0) /* no extensions */
+-        || !WPACKET_close(&epkt)
+-        || !WPACKET_close(&epkt)
+-        || !WPACKET_close(&epkt)) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    /* bp, bblen has encoding */
+-    WPACKET_get_total_written(&epkt, &bblen);
+-    if ((ee = OPENSSL_zalloc(sizeof(*ee))) == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    ee->suites = OPENSSL_malloc(sizeof(OSSL_HPKE_SUITE));
+-    if (ee->suites == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    if (ech_hash_pub_as_fname(es, pub, publen, pembuf, pembuflen) != 1) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    ee->version = echversion;
+-    ee->pub_len = publen;
+-    ee->pub = OPENSSL_memdup(pub, publen);
+-    if (ee->pub == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    ee->nsuites = 1;
+-    ee->suites[0] = suite;
+-    ee->public_name = OPENSSL_strdup(public_name);
+-    if (ee->public_name == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    ee->max_name_length = max_name_length;
+-    ee->config_id = config_id;
+-    ee->keyshare = privp;
+-    ee->encoded = OPENSSL_memdup(bp, bblen);
+-    if (ee->encoded == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    ee->encoded_len = bblen;
+-    ee->pemfname = OPENSSL_strdup(pembuf);
+-    if (ee->pemfname == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    ee->loadtime = time(0);
+-    /* push entry into store */
+-    if (es->entries == NULL)
+-        es->entries = sk_OSSL_ECHSTORE_ENTRY_new_null();
+-    if (es->entries == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    if (!sk_OSSL_ECHSTORE_ENTRY_push(es->entries, ee)) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    WPACKET_finish(&epkt);
+-    BUF_MEM_free(epkt_mem);
+-    return 1;
+-
+-err:
+-    EVP_PKEY_free(privp);
+-    WPACKET_cleanup(&epkt);
+-    BUF_MEM_free(epkt_mem);
+-    ossl_echstore_entry_free(ee);
+-    OPENSSL_free(ee);
+-    return rv;
+-}
+-
+-int OSSL_ECHSTORE_write_pem(OSSL_ECHSTORE *es, int index, BIO *out)
+-{
+-    OSSL_ECHSTORE_ENTRY *ee = NULL;
+-    int rv = 0, num = 0, chosen = 0;
+-
+-    if (es == NULL) {
+-        /*
+-         * TODO(ECH): this is a bit of a bogus error, just so as
+-         * to get the `make update` command to add the required
+-         * error number. We don't need it yet, but it's involved
+-         * in some of the build artefacts, so may as well jump
+-         * the gun a bit on it.
+-         */
+-        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_REQUIRED);
+-        return 0;
+-    }
+-    num = sk_OSSL_ECHSTORE_ENTRY_num(es->entries);
+-    if (num <= 0) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
+-        return 0;
+-    }
+-    if (index >= num) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
+-        return 0;
+-    }
+-    if (index == OSSL_ECHSTORE_LAST)
+-        chosen = num - 1;
+-    else
+-        chosen = index;
+-    ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, chosen);
+-    if (ee == NULL || ee->keyshare == NULL || ee->encoded == NULL) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
+-        return 0;
+-    }
+-    /* private key first */
+-    if (!PEM_write_bio_PrivateKey(out, ee->keyshare, NULL, NULL, 0,
+-                                  NULL, NULL)) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    if (PEM_write_bio(out, PEM_STRING_ECHCONFIG, NULL,
+-                      ee->encoded, ee->encoded_len) <= 0) {
+-        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
+-        goto err;
+-    }
+-    rv = 1;
+-err:
+-    return rv;
+-}
+-
+-int OSSL_ECHSTORE_read_echconfiglist(OSSL_ECHSTORE *es, BIO *in)
+-{
+-    return 0;
+-}
+-
+-int OSSL_ECHSTORE_get1_info(OSSL_ECHSTORE *es, OSSL_ECH_INFO **info,
+-                            int *count)
+-{
+-    return 0;
+-}
+-
+-int OSSL_ECHSTORE_downselect(OSSL_ECHSTORE *es, int index)
+-{
+-    return 0;
+-}
+-
+-int OSSL_ECHSTORE_set1_key_and_read_pem(OSSL_ECHSTORE *es, EVP_PKEY *priv,
+-                                        BIO *in, int for_retry)
+-{
+-    return 0;
+-}
+-
+-int OSSL_ECHSTORE_read_pem(OSSL_ECHSTORE *es, BIO *in, int for_retry)
+-{
+-    return 0;
+-}
+-
+-int OSSL_ECHSTORE_num_keys(OSSL_ECHSTORE *es, int *numkeys)
+-{
+-    return 0;
+-}
+-
+-int OSSL_ECHSTORE_flush_keys(OSSL_ECHSTORE *es, time_t age)
+-{
+-    return 0;
+-}
+-
+-void OSSL_ECH_INFO_free(OSSL_ECH_INFO *info, int count)
+-{
+-    return;
+-}
+-
+-int OSSL_ECH_INFO_print(BIO *out, OSSL_ECH_INFO *info, int count)
+-{
+-    return 0;
+-}
+-
+-int SSL_CTX_set1_echstore(SSL_CTX *ctx, OSSL_ECHSTORE *es)
+-{
+-    return 0;
+-}
+-
+-int SSL_set1_echstore(SSL *s, OSSL_ECHSTORE *es)
+-{
+-    return 0;
+-}
+-
+-OSSL_ECHSTORE *SSL_CTX_get1_echstore(const SSL_CTX *ctx)
+-{
+-    return NULL;
+-}
+-
+-OSSL_ECHSTORE *SSL_get1_echstore(const SSL *s)
+-{
+-    return NULL;
+-}
+-
+-int SSL_ech_set_server_names(SSL *s, const char *inner_name,
+-                             const char *outer_name, int no_outer)
+-{
+-    return 0;
+-}
+-
+-int SSL_ech_set_outer_server_name(SSL *s, const char *outer_name, int no_outer)
+-{
+-    return 0;
+-}
+-
+-int SSL_ech_set_outer_alpn_protos(SSL *s, const unsigned char *protos,
+-                                  const size_t protos_len)
+-{
+-    return 0;
+-}
+-
+-int SSL_ech_get1_status(SSL *s, char **inner_sni, char **outer_sni)
+-{
+-    return 0;
+-}
+-
+-int SSL_ech_set_grease_suite(SSL *s, const char *suite)
+-{
+-    return 0;
+-}
+-
+-int SSL_ech_set_grease_type(SSL *s, uint16_t type)
+-{
+-    return 0;
+-}
+-
+-void SSL_ech_set_callback(SSL *s, SSL_ech_cb_func f)
+-{
+-    return;
+-}
+-
+-int SSL_ech_get_retry_config(SSL *s, unsigned char **ec, size_t *eclen)
+-{
+-    return 0;
+-}
+-
+-int SSL_CTX_ech_set_outer_alpn_protos(SSL_CTX *s, const unsigned char *protos,
+-                                      const size_t protos_len)
+-{
+-    return 0;
+-}
+-
+-int SSL_CTX_ech_raw_decrypt(SSL_CTX *ctx,
+-                            int *decrypted_ok,
+-                            char **inner_sni, char **outer_sni,
+-                            unsigned char *outer_ch, size_t outer_len,
+-                            unsigned char *inner_ch, size_t *inner_len,
+-                            unsigned char **hrrtok, size_t *toklen)
+-{
+-    return 0;
+-}
+-
+-void SSL_CTX_ech_set_callback(SSL_CTX *ctx, SSL_ech_cb_func f)
+-{
+-    return;
+-}
+-
+-#endif
+diff --git a/ssl/ech/build.info b/ssl/ech/build.info
+new file mode 100644
+index 0000000000..7f60fb957c
+--- /dev/null
++++ b/ssl/ech/build.info
+@@ -0,0 +1,3 @@
++$LIBSSL=../../libssl
++
++SOURCE[$LIBSSL]=ech_ssl_apis.c ech_store.c ech_internal.c ech_helper.c
+diff --git a/ssl/ech/ech_helper.c b/ssl/ech/ech_helper.c
+new file mode 100644
+index 0000000000..bbe62eee21
+--- /dev/null
++++ b/ssl/ech/ech_helper.c
+@@ -0,0 +1,15 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++#include <openssl/ssl.h>
++#include <openssl/ech.h>
++#include "../ssl_local.h"
++#include "ech_local.h"
++
++/* TODO(ECH): move code that's used by internals and test here */
+diff --git a/ssl/ech/ech_internal.c b/ssl/ech/ech_internal.c
+new file mode 100644
+index 0000000000..94842526e5
+--- /dev/null
++++ b/ssl/ech/ech_internal.c
+@@ -0,0 +1,15 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++#include <openssl/ssl.h>
++#include <openssl/ech.h>
++#include "../ssl_local.h"
++#include "ech_local.h"
++
++/* TODO(ECH): move ECH internal code here when we get to it */
+diff --git a/ssl/ech_local.h b/ssl/ech/ech_local.h
+similarity index 97%
+rename from ssl/ech_local.h
+rename to ssl/ech/ech_local.h
+index 125795fc2a..1d89e41081 100644
+--- a/ssl/ech_local.h
++++ b/ssl/ech/ech_local.h
+@@ -31,6 +31,7 @@
+  */
+ #  define OSSL_ECH_SUPERVERBOSE
+ 
++#  define OSSL_ECH_CIPHER_LEN 4 /* ECHCipher length (2 for kdf, 2 for aead) */
+ /*
+  * Reminder of what goes in DNS for ECH RFC XXXX
+  *
+diff --git a/ssl/ech/ech_ssl_apis.c b/ssl/ech/ech_ssl_apis.c
+new file mode 100644
+index 0000000000..9bdc4bbdbe
+--- /dev/null
++++ b/ssl/ech/ech_ssl_apis.c
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++#include <openssl/ssl.h>
++#include <openssl/ech.h>
++#include "../ssl_local.h"
++
++int SSL_CTX_set1_echstore(SSL_CTX *ctx, OSSL_ECHSTORE *es)
++{
++    return 0;
++}
++
++int SSL_set1_echstore(SSL *s, OSSL_ECHSTORE *es)
++{
++    return 0;
++}
++
++OSSL_ECHSTORE *SSL_CTX_get1_echstore(const SSL_CTX *ctx)
++{
++    return NULL;
++}
++
++OSSL_ECHSTORE *SSL_get1_echstore(const SSL *s)
++{
++    return NULL;
++}
++
++int SSL_ech_set_server_names(SSL *s, const char *inner_name,
++                             const char *outer_name, int no_outer)
++{
++    return 0;
++}
++
++int SSL_ech_set_outer_server_name(SSL *s, const char *outer_name, int no_outer)
++{
++    return 0;
++}
++
++int SSL_ech_set_outer_alpn_protos(SSL *s, const unsigned char *protos,
++                                  const size_t protos_len)
++{
++    return 0;
++}
++
++int SSL_ech_get1_status(SSL *s, char **inner_sni, char **outer_sni)
++{
++    return 0;
++}
++
++int SSL_ech_set_grease_suite(SSL *s, const char *suite)
++{
++    return 0;
++}
++
++int SSL_ech_set_grease_type(SSL *s, uint16_t type)
++{
++    return 0;
++}
++
++void SSL_ech_set_callback(SSL *s, SSL_ech_cb_func f)
++{
++    return;
++}
++
++int SSL_ech_get_retry_config(SSL *s, unsigned char **ec, size_t *eclen)
++{
++    return 0;
++}
++
++int SSL_CTX_ech_set_outer_alpn_protos(SSL_CTX *s, const unsigned char *protos,
++                                      const size_t protos_len)
++{
++    return 0;
++}
++
++int SSL_CTX_ech_raw_decrypt(SSL_CTX *ctx,
++                            int *decrypted_ok,
++                            char **inner_sni, char **outer_sni,
++                            unsigned char *outer_ch, size_t outer_len,
++                            unsigned char *inner_ch, size_t *inner_len,
++                            unsigned char **hrrtok, size_t *toklen)
++{
++    if (ctx == NULL) {
++        /*
++         * TODO(ECH): this is a bit of a bogus error, just so as
++         * to get the `make update` command to add the required
++         * error number. We don't need it yet, but it's involved
++         * in some of the build artefacts, so may as well jump
++         * the gun a bit on it.
++         */
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_REQUIRED);
++        return 0;
++    }
++    return 0;
++}
++
++void SSL_CTX_ech_set_callback(SSL_CTX *ctx, SSL_ech_cb_func f)
++{
++    return;
++}
+diff --git a/ssl/ech/ech_store.c b/ssl/ech/ech_store.c
+new file mode 100644
+index 0000000000..58ba862dc9
+--- /dev/null
++++ b/ssl/ech/ech_store.c
+@@ -0,0 +1,1168 @@
++/*
++ * Copyright 2024 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the "License").  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * https://www.openssl.org/source/license.html
++ */
++
++#include <openssl/ssl.h>
++#include <openssl/ech.h>
++#include "../ssl_local.h"
++#include "ech_local.h"
++#include <openssl/rand.h>
++#include <openssl/evp.h>
++#include <openssl/core_names.h>
++
++/* a size for some crypto vars */
++#define OSSL_ECH_CRYPTO_VAR_SIZE 2048
++
++/*
++ * Used for ech_bio2buf, when reading from a BIO we allocate in chunks sized
++ * as per below, with a max number of chunks as indicated, we don't expect to
++ * go beyond one chunk in almost all cases
++ */
++#define OSSL_ECH_BUFCHUNK 512
++#define OSSL_ECH_MAXITER  32
++
++/*
++ * ECHConfigList input to OSSL_ECHSTORE_read_echconfiglist()
++ * can be either binary encoded ECHConfigList or a base64
++ * encoded ECHConfigList.
++ */
++#define OSSL_ECH_FMT_BIN       1  /* binary ECHConfigList */
++#define OSSL_ECH_FMT_B64TXT    2  /* base64 ECHConfigList */
++
++/*
++ * Telltales we use when guessing which form of encoded input we've
++ * been given for an RR value or ECHConfig.
++ * We give these the EBCDIC treatment as well - why not? :-)
++ */
++static const char B64_alphabet[] =
++    "\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f\x50\x51\x52"
++    "\x53\x54\x55\x56\x57\x58\x59\x5a\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a"
++    "\x6b\x6c\x6d\x6e\x6f\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7a\x30\x31"
++    "\x32\x33\x34\x35\x36\x37\x38\x39\x2b\x2f\x3d\x3b";
++
++#ifndef TLSEXT_MINLEN_host_name
++/*
++ * TODO(ECH): shortest DNS name we allow, e.g. "a.bc" - maybe that should
++ * be defined elsewhere, or should the check be skipped in case there's
++ * a local deployment that uses shorter names?
++ */
++# define TLSEXT_MINLEN_host_name 4
++#endif
++
++/*
++ * local functions - public APIs are at the end
++ */
++
++static void ossl_echext_free(OSSL_ECHEXT *e)
++{
++    if (e == NULL)
++        return;
++    OPENSSL_free(e->val);
++    OPENSSL_free(e);
++    return;
++}
++
++static void ossl_echstore_entry_free(OSSL_ECHSTORE_ENTRY *ee)
++{
++    if (ee == NULL)
++        return;
++    OPENSSL_free(ee->public_name);
++    OPENSSL_free(ee->pub);
++    OPENSSL_free(ee->pemfname);
++    EVP_PKEY_free(ee->keyshare);
++    OPENSSL_free(ee->encoded);
++    OPENSSL_free(ee->suites);
++    sk_OSSL_ECHEXT_pop_free(ee->exts, ossl_echext_free);
++    OPENSSL_free(ee);
++    return;
++}
++
++/*
++ * @brief hash a buffer as a pretend file name being ascii-hex of hashed buffer
++ * @param es is the OSSL_ECHSTORE we're dealing with
++ * @param buf is the input buffer
++ * @param blen is the length of buf
++ * @param ah_hash is a pointer to where to put the result
++ * @param ah_len is the length of ah_hash
++ */
++static int ech_hash_pub_as_fname(OSSL_ECHSTORE *es,
++                                 const unsigned char *buf, size_t blen,
++                                 char *ah_hash, size_t ah_len)
++{
++    unsigned char hashval[EVP_MAX_MD_SIZE];
++    size_t hashlen, actual_ah_len;
++
++    if (es == NULL
++        || EVP_Q_digest(es->libctx, "SHA2-256", es->propq,
++                        buf, blen, hashval, &hashlen) != 1
++        || OPENSSL_buf2hexstr_ex(ah_hash, ah_len, &actual_ah_len,
++                                 hashval, hashlen, '\0') != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++    return 1;
++}
++
++/*
++ * @brief Read a buffer from an input 'till eof
++ * @param in is the BIO input
++ * @param buf is where to put the buffer, allocated inside here
++ * @param len is the length of that buffer
++ *
++ * This is intended for small inputs, either files or buffers and
++ * not other kinds of BIO.
++ * TODO(ECH): how to check for oddball input BIOs?
++ */
++static int ech_bio2buf(BIO *in, unsigned char **buf, size_t *len)
++{
++    unsigned char *lptr = NULL, *lbuf = NULL, *tmp = NULL;
++    size_t sofar = 0, readbytes = 0;
++    int done = 0, brv, iter = 0;
++
++    if (buf == NULL || len == NULL)
++        return 0;
++    sofar = OSSL_ECH_BUFCHUNK;
++    lbuf = OPENSSL_zalloc(sofar);
++    if (lbuf == NULL)
++        return 0;
++    lptr = lbuf;
++    while (!BIO_eof(in) && !done && iter++ < OSSL_ECH_MAXITER) {
++        brv = BIO_read_ex(in, lptr, OSSL_ECH_BUFCHUNK, &readbytes);
++        if (brv != 1)
++            goto err;
++        if (readbytes < OSSL_ECH_BUFCHUNK) {
++            done = 1;
++            break;
++        }
++        sofar += OSSL_ECH_BUFCHUNK;
++        tmp = OPENSSL_realloc(lbuf, sofar);
++        if (tmp == NULL)
++            goto err;
++        lbuf = tmp;
++        lptr = lbuf + sofar - OSSL_ECH_BUFCHUNK;
++    }
++    if (BIO_eof(in) && done == 1) {
++        *len = sofar + readbytes - OSSL_ECH_BUFCHUNK;
++        *buf = lbuf;
++        return 1;
++    }
++err:
++    OPENSSL_free(lbuf);
++    return 0;
++}
++
++/*
++ * @brief Figure out ECHConfig encoding
++ * @param encodedval is a buffer with the encoding
++ * @param encodedlen is the length of that buffer
++ * @param guessedfmt is the detected format
++ * @return 1 for success, 0 for error
++ */
++static int ech_check_format(const unsigned char *val, size_t len, int *fmt)
++{
++    size_t span = 0;
++
++    if (fmt == NULL || len <= 4 || val == NULL)
++        return 0;
++    /* binary encoding starts with two octet length and ECH version */
++    if (len == 2 + ((size_t)(val[0]) * 256 + (size_t)(val[1]))
++        && val[2] == ((OSSL_ECH_RFCXXXX_VERSION / 256) & 0xff)
++        && val[3] == ((OSSL_ECH_RFCXXXX_VERSION % 256) & 0xff)) {
++        *fmt = OSSL_ECH_FMT_BIN;
++        return 1;
++    }
++    span = strspn((char *)val, B64_alphabet);
++    if (len <= span) {
++        *fmt = OSSL_ECH_FMT_B64TXT;
++        return 1;
++    }
++    return 0;
++}
++
++/*
++ * @brief helper to decode ECHConfig extensions
++ * @param ee is the OSSL_ECHSTORE entry for these
++ * @param exts is the binary form extensions
++ * @return 1 for good, 0 for error
++ */
++static int ech_decode_echconfig_exts(OSSL_ECHSTORE_ENTRY *ee, PACKET *exts)
++{
++    unsigned int exttype = 0;
++    size_t extlen = 0;
++    unsigned char *extval = NULL;
++    OSSL_ECHEXT *oe = NULL;
++    PACKET ext;
++
++    /*
++     * reminder: exts is a two-octet length prefixed list of:
++     * - two octet extension type
++     * - two octet extension length (can be zero)
++     * - length octets
++     * we've consumed the overall length before getting here
++     */
++    while (PACKET_remaining(exts) > 0) {
++        exttype = 0, extlen = 0;
++        extval = NULL;
++        oe = NULL;
++        if (!PACKET_get_net_2(exts, &exttype) ||
++            !PACKET_get_length_prefixed_2(exts, &ext)) {
++            ERR_raise(ERR_LIB_SSL, SSL_R_BAD_ECHCONFIG_EXTENSION);
++            goto err;
++        }
++        if (PACKET_remaining(&ext) >= OSSL_ECH_MAX_ECHCONFIGEXT_LEN) {
++            ERR_raise(ERR_LIB_SSL, SSL_R_BAD_ECHCONFIG_EXTENSION);
++            goto err;
++        }
++        if (!PACKET_memdup(&ext, &extval, &extlen)) {
++            ERR_raise(ERR_LIB_SSL, SSL_R_BAD_ECHCONFIG_EXTENSION);
++            goto err;
++        }
++        oe = OPENSSL_malloc(sizeof(*oe));
++        if (oe == NULL)
++            goto err;
++        oe->type = (uint16_t) exttype;
++        oe->val = extval;
++        extval = NULL; /* avoid double free */
++        oe->len = (uint16_t) extlen;
++        if (ee->exts == NULL)
++            ee->exts = sk_OSSL_ECHEXT_new_null();
++        if (ee->exts == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        if (!sk_OSSL_ECHEXT_push(ee->exts, oe)) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++    }
++    return 1;
++err:
++    sk_OSSL_ECHEXT_pop_free(ee->exts, ossl_echext_free);
++    ee->exts = NULL;
++    ossl_echext_free(oe);
++    OPENSSL_free(extval);
++    return 0;
++}
++
++/*
++ * @brief Check entry to see if looks good or bad
++ * @param ee is the ECHConfig to check
++ * @return 1 for all good, 0 otherwise
++ */
++static int ech_final_config_checks(OSSL_ECHSTORE_ENTRY *ee)
++{
++    OSSL_HPKE_SUITE hpke_suite;
++    size_t ind, num;
++    int goodsuitefound = 0;
++
++    /* check local support for some suite */
++    for (ind = 0; ind != ee->nsuites; ind++) {
++        /*
++         * suite_check says yes to the pseudo-aead for export, but we don't
++         * want to see it here coming from outside in an encoding
++         */
++        hpke_suite = ee->suites[ind];
++        if (OSSL_HPKE_suite_check(hpke_suite) == 1
++            && hpke_suite.aead_id != OSSL_HPKE_AEAD_ID_EXPORTONLY) {
++            goodsuitefound = 1;
++            break;
++        }
++    }
++    if (goodsuitefound == 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    /* check no mandatory exts (with high bit set in type) */
++    num = (ee->exts == NULL ? 0 : sk_OSSL_ECHEXT_num(ee->exts));
++    for (ind = 0; ind != num; ind++) {
++        OSSL_ECHEXT *oe = sk_OSSL_ECHEXT_value(ee->exts, ind);
++
++        if (oe->type & 0x8000) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++            return 0;
++        }
++    }
++    /* check public_name rules, as per spec section 4 */
++    if (ee->public_name == NULL
++        || ee->public_name[0] == '\0'
++        || ee->public_name[0] == '.'
++        || ee->public_name[strlen(ee->public_name) - 1] == '.')
++        return 0;
++    return 1;
++}
++
++/**
++ * @brief decode one ECHConfig from a packet into an entry
++ * @param rent ptr to an entry allocated within (on success)
++ * @param pkt is the encoding
++ * @param priv is an optional private key (NULL if absent)
++ * @param for_retry says whether to include in a retry_config (if priv present)
++ * @return 1 for success, 0 for error
++ */
++static int ech_decode_one_entry(OSSL_ECHSTORE_ENTRY **rent, PACKET *pkt,
++                                EVP_PKEY *priv, int for_retry)
++{
++    unsigned int ech_content_length = 0, tmpi;
++    const unsigned char *tmpecp = NULL;
++    size_t tmpeclen = 0, test_publen = 0;
++    PACKET ver_pkt, pub_pkt, cipher_suites, public_name_pkt, exts;
++    uint16_t thiskemid;
++    unsigned int suiteoctets = 0, ci = 0;
++    unsigned char cipher[OSSL_ECH_CIPHER_LEN], max_name_len;
++    unsigned char test_pub[OSSL_ECH_CRYPTO_VAR_SIZE];
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++
++    if (rent == NULL || pkt == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee = OPENSSL_zalloc(sizeof(*ee));
++    if (ee == NULL)
++        goto err;
++    /* note start of encoding so we can make a copy later */
++    tmpeclen = PACKET_remaining(pkt);
++    if (PACKET_peek_bytes(pkt, &tmpecp, tmpeclen) != 1
++        || !PACKET_get_net_2(pkt, &tmpi)) {
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++        goto err;
++    }
++    ee->version = (uint16_t) tmpi;
++
++    /* grab versioned packet data */
++    if (!PACKET_get_length_prefixed_2(pkt, &ver_pkt)) {
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++        goto err;
++    }
++    ech_content_length = PACKET_remaining(&ver_pkt);
++    switch (ee->version) {
++    case OSSL_ECH_RFCXXXX_VERSION:
++        break;
++    default:
++        /* skip over in case we get something we can handle later */
++        if (!PACKET_forward(&ver_pkt, ech_content_length)) {
++            ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++            goto err;
++        }
++        /* nothing to return but not a fail */
++        ossl_echstore_entry_free(ee);
++        *rent = NULL;
++        return 1;
++    }
++    if (!PACKET_copy_bytes(&ver_pkt, &ee->config_id, 1)
++        || !PACKET_get_net_2(&ver_pkt, &tmpi)
++        || !PACKET_get_length_prefixed_2(&ver_pkt, &pub_pkt)
++        || !PACKET_memdup(&pub_pkt, &ee->pub, &ee->pub_len)
++        || !PACKET_get_length_prefixed_2(&ver_pkt, &cipher_suites)
++        || (suiteoctets = PACKET_remaining(&cipher_suites)) <= 0
++        || (suiteoctets % 2) == 1) {
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++        goto err;
++    }
++    thiskemid = (uint16_t) tmpi;
++    ee->nsuites = suiteoctets / OSSL_ECH_CIPHER_LEN;
++    ee->suites = OPENSSL_malloc(ee->nsuites * sizeof(*ee->suites));
++    if (ee->suites == NULL)
++        goto err;
++    while (PACKET_copy_bytes(&cipher_suites, cipher,
++                             OSSL_ECH_CIPHER_LEN)) {
++        ee->suites[ci].kem_id = thiskemid;
++        ee->suites[ci].kdf_id = cipher[0] << 8 | cipher [1];
++        ee->suites[ci].aead_id = cipher[2] << 8 | cipher [3];
++        if (ci++ >= ee->nsuites) {
++            ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++            goto err;
++        }
++    }
++    if (PACKET_remaining(&cipher_suites) > 0
++        || !PACKET_copy_bytes(&ver_pkt, &max_name_len, 1)) {
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++        goto err;
++    }
++    ee->max_name_length = max_name_len;
++    if (!PACKET_get_length_prefixed_1(&ver_pkt, &public_name_pkt)) {
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++        goto err;
++    }
++    if (PACKET_contains_zero_byte(&public_name_pkt)
++        || PACKET_remaining(&public_name_pkt) < TLSEXT_MINLEN_host_name
++        || !PACKET_strndup(&public_name_pkt, &ee->public_name)) {
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++        goto err;
++    }
++    if (!PACKET_get_length_prefixed_2(&ver_pkt, &exts)) {
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++        goto err;
++    }
++    if (PACKET_remaining(&exts) > 0
++        && ech_decode_echconfig_exts(ee, &exts) != 1) {
++        ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++        goto err;
++    }
++    /* set length of encoding of this ECHConfig */
++    ee->encoded_len = PACKET_data(&ver_pkt) - tmpecp;
++    /* copy encoded as it might get free'd if a reduce happens */
++    ee->encoded = OPENSSL_memdup(tmpecp, ee->encoded_len);
++    if (ee->encoded == NULL)
++        goto err;
++    if (priv != NULL) {
++        if (EVP_PKEY_get_octet_string_param(priv,
++                                            OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
++                                            test_pub, OSSL_ECH_CRYPTO_VAR_SIZE,
++                                            &test_publen) != 1) {
++            ERR_raise(ERR_LIB_SSL, SSL_R_ECH_DECODE_ERROR);
++            goto err;
++        }
++        if (test_publen == ee->pub_len
++            && !memcmp(test_pub, ee->pub, ee->pub_len)) {
++            EVP_PKEY_up_ref(priv); /* associate the private key */
++            ee->keyshare = priv;
++            ee->for_retry = for_retry;
++        }
++    }
++    ee->loadtime = time(0);
++    *rent = ee;
++    return 1;
++err:
++    ossl_echstore_entry_free(ee);
++    *rent = NULL;
++    return 0;
++}
++
++/*
++ * @brief decode and flatten a binary encoded ECHConfigList
++ * @param es an OSSL_ECHSTORE
++ * @param priv is an optional private key (NULL if absent)
++ * @param for_retry says whether to include in a retry_config (if priv present)
++ * @param binbuf binary encoded ECHConfigList (we hope)
++ * @param binlen length of binbuf
++ * @return 1 for success, 0 for error
++ *
++ * We may only get one ECHConfig per list, but there can be more.  We want each
++ * element of the output to contain exactly one ECHConfig so that a client
++ * could sensibly down select to the one they prefer later, and so that we have
++ * the specific encoded value of that ECHConfig for inclusion in the HPKE info
++ * parameter when finally encrypting or decrypting an inner ClientHello.
++ *
++ * If a private value is provided then that'll only be associated with the
++ * relevant public value, if >1 public value was present in the ECHConfigList.
++ */
++static int ech_decode_and_flatten(OSSL_ECHSTORE *es, EVP_PKEY *priv, int for_retry,
++                                  unsigned char *binbuf, size_t binblen)
++{
++    int rv = 0;
++    size_t remaining = 0;
++    PACKET opkt, pkt;
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++
++    if (binbuf == NULL || binblen == 0 || binblen < OSSL_ECH_MIN_ECHCONFIG_LEN
++        || binblen >= OSSL_ECH_MAX_ECHCONFIG_LEN) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        goto err;
++    }
++    if (PACKET_buf_init(&opkt, binbuf, binblen) != 1
++        || !PACKET_get_length_prefixed_2(&opkt, &pkt)) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    remaining = PACKET_remaining(&pkt);
++    while (remaining > 0) {
++        if (ech_decode_one_entry(&ee, &pkt, priv, for_retry) != 1) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        remaining = PACKET_remaining(&pkt);
++        /* if unsupported version we can skip over */
++        if (ee == NULL)
++            continue;
++        /* do final checks on suites, exts, and fail if issues */
++        if (ech_final_config_checks(ee) != 1)
++            goto err;
++        /* push entry into store */
++        if (es->entries == NULL)
++            es->entries = sk_OSSL_ECHSTORE_ENTRY_new_null();
++        if (es->entries == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        if (!sk_OSSL_ECHSTORE_ENTRY_push(es->entries, ee)) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        ee = NULL;
++    }
++    rv = 1;
++err:
++    ossl_echstore_entry_free(ee);
++    return rv;
++}
++
++/*
++ * @brief check a private matches some public
++ * @param es is the ECH store
++ * @param priv is the private value
++ * @return 1 if we have a match, zero otherwise
++ */
++static int check_priv_matches(OSSL_ECHSTORE *es, EVP_PKEY *priv)
++{
++    int num, ent, gotone = 0;
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++
++    num = (es->entries == NULL ? 0 : sk_OSSL_ECHSTORE_ENTRY_num(es->entries));
++    for (ent = 0; ent != num; ent++) {
++        ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, ent);
++        if (ee == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++            return 0;
++        }
++        if (EVP_PKEY_eq(ee->keyshare, priv)) {
++            gotone = 1;
++            break;
++        }
++    }
++    return gotone;
++}
++
++/*
++ * @brief decode input ECHConfigList and associate optional private info
++ * @param es is the OSSL_ECHSTORE
++ * @param in is the BIO from which we'll get the ECHConfigList
++ * @param priv is an optional private key
++ * @param for_retry 1 if the public related to priv ought be in retry_config
++ */
++static int ech_read_priv_echconfiglist(OSSL_ECHSTORE *es, BIO *in,
++                                       EVP_PKEY *priv, int for_retry)
++{
++    int rv = 0, detfmt, tdeclen = 0;
++    size_t encodedlen = 0, binlen = 0;
++    unsigned char *encodedval = NULL, *binbuf = NULL;
++    BIO *btmp = NULL, *btmp1 = NULL;
++
++    if (es == NULL || in == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    if (ech_bio2buf(in, &encodedval, &encodedlen) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++    if (encodedlen >= OSSL_ECH_MAX_ECHCONFIG_LEN) { /* sanity check */
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    if (ech_check_format(encodedval, encodedlen, &detfmt) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        goto err;
++    }
++    if (detfmt == OSSL_ECH_FMT_BIN) { /* copy buffer if binary format */
++        binbuf = OPENSSL_memdup(encodedval, encodedlen);
++        if (binbuf == NULL)
++            goto err;
++        binlen = encodedlen;
++    }
++    if (detfmt == OSSL_ECH_FMT_B64TXT) {
++        btmp = BIO_new_mem_buf(encodedval, -1);
++        if (btmp == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        btmp1 = BIO_new(BIO_f_base64());
++        if (btmp1 == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        BIO_set_flags(btmp1, BIO_FLAGS_BASE64_NO_NL);
++        btmp = BIO_push(btmp1, btmp);
++        /* overestimate but good enough */
++        binbuf = OPENSSL_malloc(encodedlen);
++        if (binbuf == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        tdeclen = BIO_read(btmp, binbuf, encodedlen);
++        if (tdeclen <= 0) { /* need int for -1 return in failure case */
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        binlen = tdeclen;
++    }
++    if (ech_decode_and_flatten(es, priv, for_retry, binbuf, binlen) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    if (priv != NULL && check_priv_matches(es, priv) == 0)
++        goto err;
++    rv = 1;
++err:
++    BIO_free_all(btmp);
++    OPENSSL_free(binbuf);
++    OPENSSL_free(encodedval);
++    return rv;
++}
++
++/*
++ * API calls built around OSSL_ECHSSTORE
++ */
++
++OSSL_ECHSTORE *OSSL_ECHSTORE_new(OSSL_LIB_CTX *libctx, const char *propq)
++{
++    OSSL_ECHSTORE *es = NULL;
++
++    es = OPENSSL_zalloc(sizeof(*es));
++    if (es == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++    es->libctx = libctx;
++    es->propq = propq;
++    return es;
++}
++
++void OSSL_ECHSTORE_free(OSSL_ECHSTORE *es)
++{
++    if (es == NULL)
++        return;
++    sk_OSSL_ECHSTORE_ENTRY_pop_free(es->entries, ossl_echstore_entry_free);
++    OPENSSL_free(es);
++    return;
++}
++
++int OSSL_ECHSTORE_new_config(OSSL_ECHSTORE *es,
++                             uint16_t echversion, uint8_t max_name_length,
++                             const char *public_name, OSSL_HPKE_SUITE suite)
++{
++    size_t pnlen = 0, publen = OSSL_ECH_CRYPTO_VAR_SIZE;
++    unsigned char pub[OSSL_ECH_CRYPTO_VAR_SIZE];
++    int rv = 0;
++    unsigned char *bp = NULL;
++    size_t bblen = 0;
++    EVP_PKEY *privp = NULL;
++    uint8_t config_id = 0;
++    WPACKET epkt;
++    BUF_MEM *epkt_mem = NULL;
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++    char pembuf[2 * EVP_MAX_MD_SIZE + 1];
++    size_t pembuflen = 2 * EVP_MAX_MD_SIZE + 1;
++
++    /* basic checks */
++    if (es == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    pnlen = (public_name == NULL ? 0 : strlen(public_name));
++    if (pnlen == 0 || pnlen > OSSL_ECH_MAX_PUBLICNAME
++        || max_name_length > OSSL_ECH_MAX_MAXNAMELEN) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    /* this used have more versions and will again in future */
++    switch (echversion) {
++    case OSSL_ECH_RFCXXXX_VERSION:
++        break;
++    default:
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    /*
++     *   Reminder, for draft-13 we want this:
++     *
++     *   opaque HpkePublicKey<1..2^16-1>;
++     *   uint16 HpkeKemId;  // Defined in I-D.irtf-cfrg-hpke
++     *   uint16 HpkeKdfId;  // Defined in I-D.irtf-cfrg-hpke
++     *   uint16 HpkeAeadId; // Defined in I-D.irtf-cfrg-hpke
++     *   struct {
++     *       HpkeKdfId kdf_id;
++     *       HpkeAeadId aead_id;
++     *   } HpkeSymmetricCipherSuite;
++     *   struct {
++     *       uint8 config_id;
++     *       HpkeKemId kem_id;
++     *       HpkePublicKey public_key;
++     *       HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;
++     *   } HpkeKeyConfig;
++     *   struct {
++     *       HpkeKeyConfig key_config;
++     *       uint8 maximum_name_length;
++     *       opaque public_name<1..255>;
++     *       Extension extensions<0..2^16-1>;
++     *   } ECHConfigContents;
++     *   struct {
++     *       uint16 version;
++     *       uint16 length;
++     *       select (ECHConfig.version) {
++     *         case 0xfe0d: ECHConfigContents contents;
++     *       }
++     *   } ECHConfig;
++     *   ECHConfig ECHConfigList<1..2^16-1>;
++     */
++    if ((epkt_mem = BUF_MEM_new()) == NULL
++        || !BUF_MEM_grow(epkt_mem, OSSL_ECH_MAX_ECHCONFIG_LEN)
++        || !WPACKET_init(&epkt, epkt_mem)) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    /* random config_id */
++    if (RAND_bytes_ex(es->libctx, (unsigned char *)&config_id, 1,
++                      RAND_DRBG_STRENGTH) <= 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    /* key pair */
++    if (OSSL_HPKE_keygen(suite, pub, &publen, &privp, NULL, 0,
++                         es->libctx, es->propq) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    /* config id, KEM, public, KDF, AEAD, max name len, public_name, exts */
++    if ((bp = WPACKET_get_curr(&epkt)) == NULL
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_put_bytes_u16(&epkt, echversion)
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_put_bytes_u8(&epkt, config_id)
++        || !WPACKET_put_bytes_u16(&epkt, suite.kem_id)
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_memcpy(&epkt, pub, publen)
++        || !WPACKET_close(&epkt)
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_put_bytes_u16(&epkt, suite.kdf_id)
++        || !WPACKET_put_bytes_u16(&epkt, suite.aead_id)
++        || !WPACKET_close(&epkt)
++        || !WPACKET_put_bytes_u8(&epkt, max_name_length)
++        || !WPACKET_start_sub_packet_u8(&epkt)
++        || !WPACKET_memcpy(&epkt, public_name, pnlen)
++        || !WPACKET_close(&epkt)
++        || !WPACKET_start_sub_packet_u16(&epkt)
++        || !WPACKET_memcpy(&epkt, NULL, 0) /* no extensions */
++        || !WPACKET_close(&epkt)
++        || !WPACKET_close(&epkt)
++        || !WPACKET_close(&epkt)) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    /* bp, bblen has encoding */
++    WPACKET_get_total_written(&epkt, &bblen);
++    if ((ee = OPENSSL_zalloc(sizeof(*ee))) == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->suites = OPENSSL_malloc(sizeof(*ee->suites));
++    if (ee->suites == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    if (ech_hash_pub_as_fname(es, pub, publen, pembuf, pembuflen) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->version = echversion;
++    ee->pub_len = publen;
++    ee->pub = OPENSSL_memdup(pub, publen);
++    if (ee->pub == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->nsuites = 1;
++    ee->suites[0] = suite;
++    ee->public_name = OPENSSL_strdup(public_name);
++    if (ee->public_name == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->max_name_length = max_name_length;
++    ee->config_id = config_id;
++    ee->keyshare = privp;
++    /* "steal" the encoding from the memory */
++    ee->encoded = (unsigned char *)epkt_mem->data;
++    ee->encoded_len = bblen;
++    epkt_mem->data = NULL;
++    epkt_mem->length = 0;
++    ee->pemfname = OPENSSL_strdup(pembuf);
++    if (ee->pemfname == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    ee->loadtime = time(0);
++    /* push entry into store */
++    if (es->entries == NULL)
++        es->entries = sk_OSSL_ECHSTORE_ENTRY_new_null();
++    if (es->entries == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    if (!sk_OSSL_ECHSTORE_ENTRY_push(es->entries, ee)) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    WPACKET_finish(&epkt);
++    BUF_MEM_free(epkt_mem);
++    return 1;
++
++err:
++    EVP_PKEY_free(privp);
++    WPACKET_cleanup(&epkt);
++    BUF_MEM_free(epkt_mem);
++    ossl_echstore_entry_free(ee);
++    return rv;
++}
++
++int OSSL_ECHSTORE_write_pem(OSSL_ECHSTORE *es, int index, BIO *out)
++{
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++    int rv = 0, num = 0, chosen = 0, doall = 0;
++    WPACKET epkt; /* used if we want to merge ECHConfigs for output */
++    BUF_MEM *epkt_mem = NULL;
++    size_t allencoded_len;
++
++    if (es == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    num = (es->entries == NULL ? 0 : sk_OSSL_ECHSTORE_ENTRY_num(es->entries));
++    if (num <= 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    if (index >= num) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    if (index == OSSL_ECHSTORE_ALL)
++        doall = 1;
++    else if (index == OSSL_ECHSTORE_LAST)
++        chosen = num - 1;
++    else
++        chosen = index;
++    memset(&epkt, 0, sizeof(epkt));
++    if (doall == 0) {
++        ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, chosen);
++        if (ee == NULL || ee->encoded == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++            return 0;
++        }
++        /* private key first */
++        if (ee->keyshare != NULL
++            && !PEM_write_bio_PrivateKey(out, ee->keyshare, NULL, NULL, 0,
++                                         NULL, NULL)) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        if (PEM_write_bio(out, PEM_STRING_ECHCONFIG, NULL,
++                          ee->encoded, ee->encoded_len) <= 0) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++    } else {
++        /* catenate the encodings into one */
++        if ((epkt_mem = BUF_MEM_new()) == NULL
++            || !BUF_MEM_grow(epkt_mem, OSSL_ECH_MAX_ECHCONFIG_LEN)
++            || !WPACKET_init(&epkt, epkt_mem)
++            || !WPACKET_start_sub_packet_u16(&epkt)) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        for (chosen = 0; chosen != num; chosen++) {
++            ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, chosen);
++            if (ee == NULL || ee->encoded == NULL) {
++                ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++                return 0;
++            }
++            if (!WPACKET_memcpy(&epkt, ee->encoded, ee->encoded_len)) {
++                ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++                goto err;
++            }
++        }
++        if (!WPACKET_close(&epkt)) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        WPACKET_get_total_written(&epkt, &allencoded_len);
++        if (PEM_write_bio(out, PEM_STRING_ECHCONFIG, NULL,
++                          (unsigned char *)epkt_mem->data,
++                          allencoded_len) <= 0) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++    }
++    rv = 1;
++err:
++    WPACKET_cleanup(&epkt);
++    BUF_MEM_free(epkt_mem);
++    return rv;
++}
++
++int OSSL_ECHSTORE_read_echconfiglist(OSSL_ECHSTORE *es, BIO *in)
++{
++    return ech_read_priv_echconfiglist(es, in, NULL, 0);
++}
++
++int OSSL_ECHSTORE_get1_info(OSSL_ECHSTORE *es, OSSL_ECH_INFO **info,
++                            int *count)
++{
++    OSSL_ECH_INFO *linfo = NULL, *inst = NULL;
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++    unsigned int i = 0, j = 0, num = 0;
++    BIO *out = NULL;
++    time_t now = time(0);
++    size_t ehlen;
++    unsigned char *ignore = NULL;
++
++    if (es == NULL || info == NULL || count == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    num = (es->entries == NULL ? 0 : sk_OSSL_ECHSTORE_ENTRY_num(es->entries));
++    if (num == 0) {
++        *info = NULL;
++        *count = 0;
++        return 1;
++    }
++    linfo = OPENSSL_zalloc(num * sizeof(*linfo));
++    if (linfo == NULL)
++        goto err;
++    for (i = 0; i != num; i++) {
++        inst = &linfo[i];
++        ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, i);
++
++        inst->index = i;
++        inst->seconds_in_memory = now - ee->loadtime;
++        inst->public_name = OPENSSL_strdup(ee->public_name);
++        inst->has_private_key = (ee->keyshare == NULL ? 0 : 1);
++        /* Now "print" the ECHConfigList */
++        out = BIO_new(BIO_s_mem());
++        if (out == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++            goto err;
++        }
++        if (ee->version != OSSL_ECH_RFCXXXX_VERSION) {
++            /* just note we don't support that one today */
++            BIO_printf(out, "[Unsupported version (%04x)]", ee->version);
++            continue;
++        }
++        /* version, config_id, public_name, and kem */
++        BIO_printf(out, "[%04x,%02x,%s,[", ee->version,
++                   ee->config_id,
++                   ee->public_name != NULL ? (char *)ee->public_name : "NULL");
++        /* ciphersuites */
++        for (j = 0; j != ee->nsuites; j++) {
++            BIO_printf(out, "%04x,%04x,%04x", ee->suites[j].kem_id,
++                       ee->suites[j].kdf_id, ee->suites[j].aead_id);
++            if (j < (ee->nsuites - 1))
++                BIO_printf(out, ",");
++        }
++        BIO_printf(out, "],");
++        /* public key */
++        for (j = 0; j != ee->pub_len; j++)
++            BIO_printf(out, "%02x", ee->pub[j]);
++        /* max name length and (only) number of extensions */
++        BIO_printf(out, ",%02x,%02x]", ee->max_name_length,
++                   ee->exts == NULL ? 0 : sk_OSSL_ECHEXT_num(ee->exts));
++        ehlen = BIO_get_mem_data(out, &ignore);
++        inst->echconfig = OPENSSL_malloc(ehlen + 1);
++        if (inst->echconfig == NULL)
++            goto err;
++        if (BIO_read(out, inst->echconfig, ehlen) <= 0) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++            goto err;
++        }
++        inst->echconfig[ehlen] = '\0';
++        BIO_free(out);
++        out = NULL;
++    }
++    *count = num;
++    *info = linfo;
++    return 1;
++err:
++    BIO_free(out);
++    OSSL_ECH_INFO_free(linfo, num);
++    return 0;
++}
++
++int OSSL_ECHSTORE_downselect(OSSL_ECHSTORE *es, int index)
++{
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++    int i, num = 0, chosen = OSSL_ECHSTORE_ALL;
++
++    if (es == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    num = (es->entries == NULL ? 0 : sk_OSSL_ECHSTORE_ENTRY_num(es->entries));
++    if (num == 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    if (index <= OSSL_ECHSTORE_ALL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    if (index == OSSL_ECHSTORE_LAST) {
++        chosen = num - 1;
++    } else if (index >= num) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    } else {
++        chosen = index;
++    }
++    for (i = num - 1; i >= 0; i--) {
++        if (i == chosen)
++            continue;
++        ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, i);
++        ossl_echstore_entry_free(ee);
++        sk_OSSL_ECHSTORE_ENTRY_delete(es->entries, i);
++    }
++    return 1;
++}
++
++int OSSL_ECHSTORE_set1_key_and_read_pem(OSSL_ECHSTORE *es, EVP_PKEY *priv,
++                                        BIO *in, int for_retry)
++{
++    unsigned char *b64 = NULL;
++    long b64len = 0;
++    BIO *b64bio = NULL;
++    int rv = 0;
++    char *pname = NULL, *pheader = NULL;
++
++    /* we allow for a NULL private key */
++    if (es == NULL || in == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    if (PEM_read_bio(in, &pname, &pheader, &b64, &b64len) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++    if (pname == NULL || strcmp(pname, PEM_STRING_ECHCONFIG) != 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    b64bio = BIO_new(BIO_s_mem());
++    if (b64bio == NULL
++        || BIO_write(b64bio, b64, b64len) <= 0
++        || ech_read_priv_echconfiglist(es, b64bio, priv, for_retry) != 1) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    rv = 1;
++err:
++    OPENSSL_free(pname);
++    OPENSSL_free(pheader);
++    BIO_free_all(b64bio);
++    OPENSSL_free(b64);
++    return rv;
++}
++
++int OSSL_ECHSTORE_read_pem(OSSL_ECHSTORE *es, BIO *in, int for_retry)
++{
++    EVP_PKEY *priv = NULL;
++    int rv = 0;
++    BIO *fbio = BIO_new(BIO_f_buffer());
++
++    if (fbio == NULL || es == NULL || in == NULL) {
++        BIO_free_all(fbio);
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    /*
++     * Read private key then handoff to set1_key_and_read_pem.
++     * We allow for no private key as an option, to handle that
++     * the BIO_f_buffer allows us to seek back to the start.
++     */
++    BIO_push(fbio, in);
++    if (!PEM_read_bio_PrivateKey(fbio, &priv, NULL, NULL)
++        && BIO_seek(fbio, 0) < 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++    rv = OSSL_ECHSTORE_set1_key_and_read_pem(es, priv, fbio, for_retry);
++err:
++    EVP_PKEY_free(priv);
++    BIO_pop(fbio);
++    BIO_free_all(fbio);
++    return rv;
++}
++
++int OSSL_ECHSTORE_num_keys(OSSL_ECHSTORE *es, int *numkeys)
++{
++    int i, num = 0, count = 0;
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++
++    if (es == NULL || numkeys == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    num = (es->entries == NULL ? 0 : sk_OSSL_ECHSTORE_ENTRY_num(es->entries));
++    for (i = 0; i != num; i++) {
++        ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, i);
++        if (ee == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR);
++            return 0;
++        }
++        count += (ee->keyshare != NULL);
++    }
++    *numkeys = count;
++    return 1;
++}
++
++int OSSL_ECHSTORE_flush_keys(OSSL_ECHSTORE *es, time_t age)
++{
++    OSSL_ECHSTORE_ENTRY *ee = NULL;
++    int i, num = 0;
++    time_t now = time(0);
++
++    if (es == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    num = (es->entries == NULL ? 0 : sk_OSSL_ECHSTORE_ENTRY_num(es->entries));
++    if (num == 0) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++        return 0;
++    }
++    for (i = num - 1; i >= 0; i--) {
++        ee = sk_OSSL_ECHSTORE_ENTRY_value(es->entries, i);
++        if (ee == NULL) {
++            ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_INVALID_ARGUMENT);
++            return 0;
++        }
++        if (ee->keyshare != NULL && ((ee->loadtime + age) > now)) {
++            ossl_echstore_entry_free(ee);
++            sk_OSSL_ECHSTORE_ENTRY_delete(es->entries, i);
++        }
++    }
++    return 1;
++}
++
++void OSSL_ECH_INFO_free(OSSL_ECH_INFO *info, int count)
++{
++    int i;
++
++    if (info == NULL)
++        return;
++    for (i = 0; i != count; i++) {
++        OPENSSL_free(info[i].public_name);
++        OPENSSL_free(info[i].inner_name);
++        OPENSSL_free(info[i].outer_alpns);
++        OPENSSL_free(info[i].inner_alpns);
++        OPENSSL_free(info[i].echconfig);
++    }
++    OPENSSL_free(info);
++    return;
++}
++
++int OSSL_ECH_INFO_print(BIO *out, OSSL_ECH_INFO *info, int index)
++{
++    if (out == NULL || info == NULL) {
++        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    BIO_printf(out, "ECH entry: %d public_name: %s age: %d%s\n",
++               index, info[index].public_name,
++               (int)info[index].seconds_in_memory,
++               info[index].has_private_key ? " (has private key)" : "");
++    BIO_printf(out, "\t%s\n", info[index].echconfig);
++    return 1;
++}
+diff --git a/ssl/ssl_err.c b/ssl/ssl_err.c
+index 90a5172777..7cb6b8996d 100644
+--- a/ssl/ssl_err.c
++++ b/ssl/ssl_err.c
+@@ -16,33 +16,35 @@
+ 
+ static const ERR_STRING_DATA SSL_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_APPLICATION_DATA_AFTER_CLOSE_NOTIFY),
+-    "application data after close notify"},
++     "application data after close notify"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_APP_DATA_IN_HANDSHAKE),
+-    "app data in handshake"},
++     "app data in handshake"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ATTEMPT_TO_REUSE_SESSION_IN_DIFFERENT_CONTEXT),
+-    "attempt to reuse session in different context"},
++     "attempt to reuse session in different context"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_AT_LEAST_TLS_1_2_NEEDED_IN_SUITEB_MODE),
+-    "at least (D)TLS 1.2 needed in Suite B mode"},
++     "at least (D)TLS 1.2 needed in Suite B mode"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_CERTIFICATE), "bad certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_CHANGE_CIPHER_SPEC),
+-    "bad change cipher spec"},
++     "bad change cipher spec"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_CIPHER), "bad cipher"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_COMPRESSION_ALGORITHM),
+-    "bad compression algorithm"},
++     "bad compression algorithm"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_DATA), "bad data"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_DATA_RETURNED_BY_CALLBACK),
+-    "bad data returned by callback"},
++     "bad data returned by callback"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_DECOMPRESSION), "bad decompression"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_DH_VALUE), "bad dh value"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_DIGEST_LENGTH), "bad digest length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_EARLY_DATA), "bad early data"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_ECC_CERT), "bad ecc cert"},
++    {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_ECHCONFIG_EXTENSION),
++     "bad echconfig extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_ECPOINT), "bad ecpoint"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_EXTENSION), "bad extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_HANDSHAKE_LENGTH),
+-    "bad handshake length"},
++     "bad handshake length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_HANDSHAKE_STATE),
+-    "bad handshake state"},
++     "bad handshake state"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_HELLO_REQUEST), "bad hello request"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_HRR_VERSION), "bad hrr version"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_KEY_SHARE), "bad key share"},
+@@ -52,7 +54,7 @@ static const ERR_STRING_DATA SSL_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_PACKET), "bad packet"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_PACKET_LENGTH), "bad packet length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_PROTOCOL_VERSION_NUMBER),
+-    "bad protocol version number"},
++     "bad protocol version number"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_PSK), "bad psk"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_PSK_IDENTITY), "bad psk identity"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_RECORD_TYPE), "bad record type"},
+@@ -62,561 +64,562 @@ static const ERR_STRING_DATA SSL_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_SRP_PARAMETERS), "bad srp parameters"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_SRTP_MKI_VALUE), "bad srtp mki value"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_SRTP_PROTECTION_PROFILE_LIST),
+-    "bad srtp protection profile list"},
++     "bad srtp protection profile list"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_SSL_FILETYPE), "bad ssl filetype"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_VALUE), "bad value"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_WRITE_RETRY), "bad write retry"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BINDER_DOES_NOT_VERIFY),
+-    "binder does not verify"},
++     "binder does not verify"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BIO_NOT_SET), "bio not set"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BLOCK_CIPHER_PAD_IS_WRONG),
+-    "block cipher pad is wrong"},
++     "block cipher pad is wrong"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BN_LIB), "bn lib"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CALLBACK_FAILED), "callback failed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CANNOT_CHANGE_CIPHER),
+-    "cannot change cipher"},
++     "cannot change cipher"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CANNOT_GET_GROUP_NAME),
+-    "cannot get group name"},
++     "cannot get group name"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CA_DN_LENGTH_MISMATCH),
+-    "ca dn length mismatch"},
++     "ca dn length mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CA_KEY_TOO_SMALL), "ca key too small"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CA_MD_TOO_WEAK), "ca md too weak"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CCS_RECEIVED_EARLY), "ccs received early"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CERTIFICATE_VERIFY_FAILED),
+-    "certificate verify failed"},
++     "certificate verify failed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CERT_CB_ERROR), "cert cb error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CERT_LENGTH_MISMATCH),
+-    "cert length mismatch"},
++     "cert length mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CIPHERSUITE_DIGEST_HAS_CHANGED),
+-    "ciphersuite digest has changed"},
++     "ciphersuite digest has changed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CIPHER_CODE_WRONG_LENGTH),
+-    "cipher code wrong length"},
++     "cipher code wrong length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CLIENTHELLO_TLSEXT), "clienthello tlsext"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_COMPRESSED_LENGTH_TOO_LONG),
+-    "compressed length too long"},
++     "compressed length too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_COMPRESSION_DISABLED),
+-    "compression disabled"},
++     "compression disabled"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_COMPRESSION_FAILURE),
+-    "compression failure"},
++     "compression failure"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_COMPRESSION_ID_NOT_WITHIN_PRIVATE_RANGE),
+-    "compression id not within private range"},
++     "compression id not within private range"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_COMPRESSION_LIBRARY_ERROR),
+-    "compression library error"},
++     "compression library error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CONNECTION_TYPE_NOT_SET),
+-    "connection type not set"},
++     "connection type not set"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CONN_USE_ONLY), "conn use only"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CONTEXT_NOT_DANE_ENABLED),
+-    "context not dane enabled"},
++     "context not dane enabled"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_COOKIE_GEN_CALLBACK_FAILURE),
+-    "cookie gen callback failure"},
++     "cookie gen callback failure"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_COOKIE_MISMATCH), "cookie mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_COPY_PARAMETERS_FAILED),
+-    "copy parameters failed"},
++     "copy parameters failed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CUSTOM_EXT_HANDLER_ALREADY_INSTALLED),
+-    "custom ext handler already installed"},
++     "custom ext handler already installed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_ALREADY_ENABLED),
+-    "dane already enabled"},
++     "dane already enabled"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_CANNOT_OVERRIDE_MTYPE_FULL),
+-    "dane cannot override mtype full"},
++     "dane cannot override mtype full"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_NOT_ENABLED), "dane not enabled"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_TLSA_BAD_CERTIFICATE),
+-    "dane tlsa bad certificate"},
++     "dane tlsa bad certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_TLSA_BAD_CERTIFICATE_USAGE),
+-    "dane tlsa bad certificate usage"},
++     "dane tlsa bad certificate usage"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_TLSA_BAD_DATA_LENGTH),
+-    "dane tlsa bad data length"},
++     "dane tlsa bad data length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_TLSA_BAD_DIGEST_LENGTH),
+-    "dane tlsa bad digest length"},
++     "dane tlsa bad digest length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_TLSA_BAD_MATCHING_TYPE),
+-    "dane tlsa bad matching type"},
++     "dane tlsa bad matching type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_TLSA_BAD_PUBLIC_KEY),
+-    "dane tlsa bad public key"},
++     "dane tlsa bad public key"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_TLSA_BAD_SELECTOR),
+-    "dane tlsa bad selector"},
++     "dane tlsa bad selector"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DANE_TLSA_NULL_DATA),
+-    "dane tlsa null data"},
++     "dane tlsa null data"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DATA_BETWEEN_CCS_AND_FINISHED),
+-    "data between ccs and finished"},
++     "data between ccs and finished"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DATA_LENGTH_TOO_LONG),
+-    "data length too long"},
++     "data length too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DECRYPTION_FAILED), "decryption failed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC),
+-    "decryption failed or bad record mac"},
++     "decryption failed or bad record mac"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DH_KEY_TOO_SMALL), "dh key too small"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DH_PUBLIC_VALUE_LENGTH_IS_WRONG),
+-    "dh public value length is wrong"},
++     "dh public value length is wrong"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DIGEST_CHECK_FAILED),
+-    "digest check failed"},
++     "digest check failed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DTLS_MESSAGE_TOO_BIG),
+-    "dtls message too big"},
++     "dtls message too big"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_DUPLICATE_COMPRESSION_ID),
+-    "duplicate compression id"},
++     "duplicate compression id"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ECC_CERT_NOT_FOR_SIGNING),
+-    "ecc cert not for signing"},
++     "ecc cert not for signing"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ECDH_REQUIRED_FOR_SUITEB_MODE),
+-    "ecdh required for suiteb mode"},
++     "ecdh required for suiteb mode"},
++    {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ECH_DECODE_ERROR), "ech decode error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ECH_REQUIRED), "ech required"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EE_KEY_TOO_SMALL), "ee key too small"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EMPTY_RAW_PUBLIC_KEY),
+-    "empty raw public key"},
++     "empty raw public key"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EMPTY_SRTP_PROTECTION_PROFILE_LIST),
+-    "empty srtp protection profile list"},
++     "empty srtp protection profile list"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ENCRYPTED_LENGTH_TOO_LONG),
+-    "encrypted length too long"},
++     "encrypted length too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ERROR_IN_RECEIVED_CIPHER_LIST),
+-    "error in received cipher list"},
++     "error in received cipher list"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ERROR_IN_SYSTEM_DEFAULT_CONFIG),
+-    "error in system default config"},
++     "error in system default config"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ERROR_SETTING_TLSA_BASE_DOMAIN),
+-    "error setting tlsa base domain"},
++     "error setting tlsa base domain"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EXCEEDS_MAX_FRAGMENT_SIZE),
+-    "exceeds max fragment size"},
++     "exceeds max fragment size"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EXCESSIVE_MESSAGE_SIZE),
+-    "excessive message size"},
++     "excessive message size"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EXTENSION_NOT_RECEIVED),
+-    "extension not received"},
++     "extension not received"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EXTRA_DATA_IN_MESSAGE),
+-    "extra data in message"},
++     "extra data in message"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_EXT_LENGTH_MISMATCH),
+-    "ext length mismatch"},
++     "ext length mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_FAILED_TO_GET_PARAMETER),
+-    "failed to get parameter"},
++     "failed to get parameter"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_FAILED_TO_INIT_ASYNC),
+-    "failed to init async"},
++     "failed to init async"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_FEATURE_NEGOTIATION_NOT_COMPLETE),
+-    "feature negotiation not complete"},
++     "feature negotiation not complete"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_FEATURE_NOT_RENEGOTIABLE),
+-    "feature not renegotiable"},
++     "feature not renegotiable"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_FRAGMENTED_CLIENT_HELLO),
+-    "fragmented client hello"},
++     "fragmented client hello"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_GOT_A_FIN_BEFORE_A_CCS),
+-    "got a fin before a ccs"},
++     "got a fin before a ccs"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_HTTPS_PROXY_REQUEST),
+-    "https proxy request"},
++     "https proxy request"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_HTTP_REQUEST), "http request"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ILLEGAL_POINT_COMPRESSION),
+-    "illegal point compression"},
++     "illegal point compression"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_ILLEGAL_SUITEB_DIGEST),
+-    "illegal Suite B digest"},
++     "illegal Suite B digest"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INAPPROPRIATE_FALLBACK),
+-    "inappropriate fallback"},
++     "inappropriate fallback"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INCONSISTENT_COMPRESSION),
+-    "inconsistent compression"},
++     "inconsistent compression"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INCONSISTENT_EARLY_DATA_ALPN),
+-    "inconsistent early data alpn"},
++     "inconsistent early data alpn"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INCONSISTENT_EARLY_DATA_SNI),
+-    "inconsistent early data sni"},
++     "inconsistent early data sni"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INCONSISTENT_EXTMS), "inconsistent extms"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INSUFFICIENT_SECURITY),
+-    "insufficient security"},
++     "insufficient security"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_ALERT), "invalid alert"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_CCS_MESSAGE),
+-    "invalid ccs message"},
++     "invalid ccs message"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_CERTIFICATE_OR_ALG),
+-    "invalid certificate or alg"},
++     "invalid certificate or alg"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_COMMAND), "invalid command"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_COMPRESSION_ALGORITHM),
+-    "invalid compression algorithm"},
++     "invalid compression algorithm"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_CONFIG), "invalid config"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_CONFIGURATION_NAME),
+-    "invalid configuration name"},
++     "invalid configuration name"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_CONTEXT), "invalid context"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_CT_VALIDATION_TYPE),
+-    "invalid ct validation type"},
++     "invalid ct validation type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_KEY_UPDATE_TYPE),
+-    "invalid key update type"},
++     "invalid key update type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_MAX_EARLY_DATA),
+-    "invalid max early data"},
++     "invalid max early data"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_NULL_CMD_NAME),
+-    "invalid null cmd name"},
++     "invalid null cmd name"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_RAW_PUBLIC_KEY),
+-    "invalid raw public key"},
++     "invalid raw public key"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_RECORD), "invalid record"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_SEQUENCE_NUMBER),
+-    "invalid sequence number"},
++     "invalid sequence number"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_SERVERINFO_DATA),
+-    "invalid serverinfo data"},
++     "invalid serverinfo data"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_SESSION_ID), "invalid session id"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_SRP_USERNAME),
+-    "invalid srp username"},
++     "invalid srp username"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_STATUS_RESPONSE),
+-    "invalid status response"},
++     "invalid status response"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_INVALID_TICKET_KEYS_LENGTH),
+-    "invalid ticket keys length"},
++     "invalid ticket keys length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_LEGACY_SIGALG_DISALLOWED_OR_UNSUPPORTED),
+-    "legacy sigalg disallowed or unsupported"},
++     "legacy sigalg disallowed or unsupported"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_LENGTH_MISMATCH), "length mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_LENGTH_TOO_LONG), "length too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_LENGTH_TOO_SHORT), "length too short"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_LIBRARY_BUG), "library bug"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_LIBRARY_HAS_NO_CIPHERS),
+-    "library has no ciphers"},
++     "library has no ciphers"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MAXIMUM_ENCRYPTED_PKTS_REACHED),
+-    "maximum encrypted pkts reached"},
++     "maximum encrypted pkts reached"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_DSA_SIGNING_CERT),
+-    "missing dsa signing cert"},
++     "missing dsa signing cert"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_ECDSA_SIGNING_CERT),
+-    "missing ecdsa signing cert"},
++     "missing ecdsa signing cert"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_FATAL), "missing fatal"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_PARAMETERS), "missing parameters"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_PSK_KEX_MODES_EXTENSION),
+-    "missing psk kex modes extension"},
++     "missing psk kex modes extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_RSA_CERTIFICATE),
+-    "missing rsa certificate"},
++     "missing rsa certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_RSA_ENCRYPTING_CERT),
+-    "missing rsa encrypting cert"},
++     "missing rsa encrypting cert"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_RSA_SIGNING_CERT),
+-    "missing rsa signing cert"},
++     "missing rsa signing cert"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_SIGALGS_EXTENSION),
+-    "missing sigalgs extension"},
++     "missing sigalgs extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_SIGNING_CERT),
+-    "missing signing cert"},
++     "missing signing cert"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_SRP_PARAM),
+-    "can't find SRP server param"},
++     "can't find SRP server param"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_SUPPORTED_GROUPS_EXTENSION),
+-    "missing supported groups extension"},
++     "missing supported groups extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_SUPPORTED_VERSIONS_EXTENSION),
+-    "missing supported versions extension"},
++     "missing supported versions extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_TMP_DH_KEY), "missing tmp dh key"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MISSING_TMP_ECDH_KEY),
+-    "missing tmp ecdh key"},
++     "missing tmp ecdh key"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_MIXED_HANDSHAKE_AND_NON_HANDSHAKE_DATA),
+-    "mixed handshake and non handshake data"},
++     "mixed handshake and non handshake data"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NOT_ON_RECORD_BOUNDARY),
+-    "not on record boundary"},
++     "not on record boundary"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NOT_REPLACING_CERTIFICATE),
+-    "not replacing certificate"},
++     "not replacing certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NOT_SERVER), "not server"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_APPLICATION_PROTOCOL),
+-    "no application protocol"},
++     "no application protocol"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_CERTIFICATES_RETURNED),
+-    "no certificates returned"},
++     "no certificates returned"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_CERTIFICATE_ASSIGNED),
+-    "no certificate assigned"},
++     "no certificate assigned"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_CERTIFICATE_SET), "no certificate set"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_CHANGE_FOLLOWING_HRR),
+-    "no change following hrr"},
++     "no change following hrr"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_CIPHERS_AVAILABLE),
+-    "no ciphers available"},
++     "no ciphers available"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_CIPHERS_SPECIFIED),
+-    "no ciphers specified"},
++     "no ciphers specified"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_CIPHER_MATCH), "no cipher match"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_CLIENT_CERT_METHOD),
+-    "no client cert method"},
++     "no client cert method"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_COMPRESSION_SPECIFIED),
+-    "no compression specified"},
++     "no compression specified"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_COOKIE_CALLBACK_SET),
+-    "no cookie callback set"},
++     "no cookie callback set"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_GOST_CERTIFICATE_SENT_BY_PEER),
+-    "Peer haven't sent GOST certificate, required for selected ciphersuite"},
++     "Peer haven't sent GOST certificate, required for selected ciphersuite"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_METHOD_SPECIFIED),
+-    "no method specified"},
++     "no method specified"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_PEM_EXTENSIONS), "no pem extensions"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_PRIVATE_KEY_ASSIGNED),
+-    "no private key assigned"},
++     "no private key assigned"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_PROTOCOLS_AVAILABLE),
+-    "no protocols available"},
++     "no protocols available"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_RENEGOTIATION), "no renegotiation"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_REQUIRED_DIGEST), "no required digest"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SHARED_CIPHER), "no shared cipher"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SHARED_GROUPS), "no shared groups"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SHARED_SIGNATURE_ALGORITHMS),
+-    "no shared signature algorithms"},
++     "no shared signature algorithms"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SRTP_PROFILES), "no srtp profiles"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_STREAM), "no stream"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SUITABLE_DIGEST_ALGORITHM),
+-    "no suitable digest algorithm"},
++     "no suitable digest algorithm"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SUITABLE_GROUPS), "no suitable groups"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SUITABLE_KEY_SHARE),
+-    "no suitable key share"},
++     "no suitable key share"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SUITABLE_RECORD_LAYER),
+-    "no suitable record layer"},
++     "no suitable record layer"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_SUITABLE_SIGNATURE_ALGORITHM),
+-    "no suitable signature algorithm"},
++     "no suitable signature algorithm"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_VALID_SCTS), "no valid scts"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NO_VERIFY_COOKIE_CALLBACK),
+-    "no verify cookie callback"},
++     "no verify cookie callback"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NULL_SSL_CTX), "null ssl ctx"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_NULL_SSL_METHOD_PASSED),
+-    "null ssl method passed"},
++     "null ssl method passed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_OCSP_CALLBACK_FAILURE),
+-    "ocsp callback failure"},
++     "ocsp callback failure"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_OLD_SESSION_CIPHER_NOT_RETURNED),
+-    "old session cipher not returned"},
++     "old session cipher not returned"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_OLD_SESSION_COMPRESSION_ALGORITHM_NOT_RETURNED),
+-    "old session compression algorithm not returned"},
++     "old session compression algorithm not returned"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_OVERFLOW_ERROR), "overflow error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PACKET_LENGTH_TOO_LONG),
+-    "packet length too long"},
++     "packet length too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PARSE_TLSEXT), "parse tlsext"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PATH_TOO_LONG), "path too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PEER_DID_NOT_RETURN_A_CERTIFICATE),
+-    "peer did not return a certificate"},
++     "peer did not return a certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PEM_NAME_BAD_PREFIX),
+-    "pem name bad prefix"},
++     "pem name bad prefix"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PEM_NAME_TOO_SHORT), "pem name too short"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PIPELINE_FAILURE), "pipeline failure"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_POLL_REQUEST_NOT_SUPPORTED),
+-    "poll request not supported"},
++     "poll request not supported"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_POST_HANDSHAKE_AUTH_ENCODING_ERR),
+-    "post handshake auth encoding err"},
++     "post handshake auth encoding err"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PRIVATE_KEY_MISMATCH),
+-    "private key mismatch"},
++     "private key mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PROTOCOL_IS_SHUTDOWN),
+-    "protocol is shutdown"},
++     "protocol is shutdown"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PSK_IDENTITY_NOT_FOUND),
+-    "psk identity not found"},
++     "psk identity not found"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PSK_NO_CLIENT_CB), "psk no client cb"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_PSK_NO_SERVER_CB), "psk no server cb"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_QUIC_HANDSHAKE_LAYER_ERROR),
+-    "quic handshake layer error"},
++     "quic handshake layer error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_QUIC_NETWORK_ERROR), "quic network error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_QUIC_PROTOCOL_ERROR),
+-    "quic protocol error"},
++     "quic protocol error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_READ_BIO_NOT_SET), "read bio not set"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_READ_TIMEOUT_EXPIRED),
+-    "read timeout expired"},
++     "read timeout expired"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_RECORDS_NOT_RELEASED),
+-    "records not released"},
++     "records not released"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_RECORD_LAYER_FAILURE),
+-    "record layer failure"},
++     "record layer failure"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_RECORD_LENGTH_MISMATCH),
+-    "record length mismatch"},
++     "record length mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_RECORD_TOO_SMALL), "record too small"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_REMOTE_PEER_ADDRESS_NOT_SET),
+-    "remote peer address not set"},
++     "remote peer address not set"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_RENEGOTIATE_EXT_TOO_LONG),
+-    "renegotiate ext too long"},
++     "renegotiate ext too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_RENEGOTIATION_ENCODING_ERR),
+-    "renegotiation encoding err"},
++     "renegotiation encoding err"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_RENEGOTIATION_MISMATCH),
+-    "renegotiation mismatch"},
++     "renegotiation mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_REQUEST_PENDING), "request pending"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_REQUEST_SENT), "request sent"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_REQUIRED_CIPHER_MISSING),
+-    "required cipher missing"},
++     "required cipher missing"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_REQUIRED_COMPRESSION_ALGORITHM_MISSING),
+-    "required compression algorithm missing"},
++     "required compression algorithm missing"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING),
+-    "scsv received when renegotiating"},
++     "scsv received when renegotiating"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SCT_VERIFICATION_FAILED),
+-    "sct verification failed"},
++     "sct verification failed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SEQUENCE_CTR_WRAPPED),
+-    "sequence ctr wrapped"},
++     "sequence ctr wrapped"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SERVERHELLO_TLSEXT), "serverhello tlsext"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED),
+-    "session id context uninitialized"},
++     "session id context uninitialized"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SHUTDOWN_WHILE_IN_INIT),
+-    "shutdown while in init"},
++     "shutdown while in init"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SIGNATURE_ALGORITHMS_ERROR),
+-    "signature algorithms error"},
++     "signature algorithms error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SIGNATURE_FOR_NON_SIGNING_CERTIFICATE),
+-    "signature for non signing certificate"},
++     "signature for non signing certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SRP_A_CALC), "error with the srp params"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SRTP_COULD_NOT_ALLOCATE_PROFILES),
+-    "srtp could not allocate profiles"},
++     "srtp could not allocate profiles"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SRTP_PROTECTION_PROFILE_LIST_TOO_LONG),
+-    "srtp protection profile list too long"},
++     "srtp protection profile list too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SRTP_UNKNOWN_PROTECTION_PROFILE),
+-    "srtp unknown protection profile"},
++     "srtp unknown protection profile"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL3_EXT_INVALID_MAX_FRAGMENT_LENGTH),
+-    "ssl3 ext invalid max fragment length"},
++     "ssl3 ext invalid max fragment length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL3_EXT_INVALID_SERVERNAME),
+-    "ssl3 ext invalid servername"},
++     "ssl3 ext invalid servername"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL3_EXT_INVALID_SERVERNAME_TYPE),
+-    "ssl3 ext invalid servername type"},
++     "ssl3 ext invalid servername type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL3_SESSION_ID_TOO_LONG),
+-    "ssl3 session id too long"},
++     "ssl3 session id too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_BAD_CERTIFICATE),
+-    "ssl/tls alert bad certificate"},
++     "ssl/tls alert bad certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_BAD_RECORD_MAC),
+-    "ssl/tls alert bad record mac"},
++     "ssl/tls alert bad record mac"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED),
+-    "ssl/tls alert certificate expired"},
++     "ssl/tls alert certificate expired"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED),
+-    "ssl/tls alert certificate revoked"},
++     "ssl/tls alert certificate revoked"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN),
+-    "ssl/tls alert certificate unknown"},
++     "ssl/tls alert certificate unknown"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_DECOMPRESSION_FAILURE),
+-    "ssl/tls alert decompression failure"},
++     "ssl/tls alert decompression failure"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE),
+-    "ssl/tls alert handshake failure"},
++     "ssl/tls alert handshake failure"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_ILLEGAL_PARAMETER),
+-    "ssl/tls alert illegal parameter"},
++     "ssl/tls alert illegal parameter"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_NO_CERTIFICATE),
+-    "ssl/tls alert no certificate"},
++     "ssl/tls alert no certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_UNEXPECTED_MESSAGE),
+-    "ssl/tls alert unexpected message"},
++     "ssl/tls alert unexpected message"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE),
+-    "ssl/tls alert unsupported certificate"},
++     "ssl/tls alert unsupported certificate"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_COMMAND_SECTION_EMPTY),
+-    "ssl command section empty"},
++     "ssl command section empty"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_COMMAND_SECTION_NOT_FOUND),
+-    "ssl command section not found"},
++     "ssl command section not found"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_CTX_HAS_NO_DEFAULT_SSL_VERSION),
+-    "ssl ctx has no default ssl version"},
++     "ssl ctx has no default ssl version"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_HANDSHAKE_FAILURE),
+-    "ssl handshake failure"},
++     "ssl handshake failure"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_LIBRARY_HAS_NO_CIPHERS),
+-    "ssl library has no ciphers"},
++     "ssl library has no ciphers"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_NEGATIVE_LENGTH),
+-    "ssl negative length"},
++     "ssl negative length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_SECTION_EMPTY), "ssl section empty"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_SECTION_NOT_FOUND),
+-    "ssl section not found"},
++     "ssl section not found"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_SESSION_ID_CALLBACK_FAILED),
+-    "ssl session id callback failed"},
++     "ssl session id callback failed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_SESSION_ID_CONFLICT),
+-    "ssl session id conflict"},
++     "ssl session id conflict"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_SESSION_ID_CONTEXT_TOO_LONG),
+-    "ssl session id context too long"},
++     "ssl session id context too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_SESSION_ID_HAS_BAD_LENGTH),
+-    "ssl session id has bad length"},
++     "ssl session id has bad length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_SESSION_ID_TOO_LONG),
+-    "ssl session id too long"},
++     "ssl session id too long"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_SSL_SESSION_VERSION_MISMATCH),
+-    "ssl session version mismatch"},
++     "ssl session version mismatch"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_STILL_IN_INIT), "still in init"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_STREAM_COUNT_LIMITED),
+-    "stream count limited"},
++     "stream count limited"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_STREAM_FINISHED), "stream finished"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_STREAM_RECV_ONLY), "stream recv only"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_STREAM_RESET), "stream reset"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_STREAM_SEND_ONLY), "stream send only"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV13_ALERT_CERTIFICATE_REQUIRED),
+-    "tlsv13 alert certificate required"},
++     "tlsv13 alert certificate required"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV13_ALERT_MISSING_EXTENSION),
+-    "tlsv13 alert missing extension"},
++     "tlsv13 alert missing extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_ACCESS_DENIED),
+-    "tlsv1 alert access denied"},
++     "tlsv1 alert access denied"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_DECODE_ERROR),
+-    "tlsv1 alert decode error"},
++     "tlsv1 alert decode error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_DECRYPTION_FAILED),
+-    "tlsv1 alert decryption failed"},
++     "tlsv1 alert decryption failed"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_DECRYPT_ERROR),
+-    "tlsv1 alert decrypt error"},
++     "tlsv1 alert decrypt error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_EXPORT_RESTRICTION),
+-    "tlsv1 alert export restriction"},
++     "tlsv1 alert export restriction"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_INAPPROPRIATE_FALLBACK),
+-    "tlsv1 alert inappropriate fallback"},
++     "tlsv1 alert inappropriate fallback"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_INSUFFICIENT_SECURITY),
+-    "tlsv1 alert insufficient security"},
++     "tlsv1 alert insufficient security"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_INTERNAL_ERROR),
+-    "tlsv1 alert internal error"},
++     "tlsv1 alert internal error"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL),
+-    "tlsv1 alert no application protocol"},
++     "tlsv1 alert no application protocol"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_NO_RENEGOTIATION),
+-    "tlsv1 alert no renegotiation"},
++     "tlsv1 alert no renegotiation"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_PROTOCOL_VERSION),
+-    "tlsv1 alert protocol version"},
++     "tlsv1 alert protocol version"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_RECORD_OVERFLOW),
+-    "tlsv1 alert record overflow"},
++     "tlsv1 alert record overflow"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_UNKNOWN_CA),
+-    "tlsv1 alert unknown ca"},
++     "tlsv1 alert unknown ca"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_UNKNOWN_PSK_IDENTITY),
+-    "tlsv1 alert unknown psk identity"},
++     "tlsv1 alert unknown psk identity"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_ALERT_USER_CANCELLED),
+-    "tlsv1 alert user cancelled"},
++     "tlsv1 alert user cancelled"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE),
+-    "tlsv1 bad certificate hash value"},
++     "tlsv1 bad certificate hash value"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE),
+-    "tlsv1 bad certificate status response"},
++     "tlsv1 bad certificate status response"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_CERTIFICATE_UNOBTAINABLE),
+-    "tlsv1 certificate unobtainable"},
++     "tlsv1 certificate unobtainable"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_UNRECOGNIZED_NAME),
+-    "tlsv1 unrecognized name"},
++     "tlsv1 unrecognized name"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLSV1_UNSUPPORTED_EXTENSION),
+-    "tlsv1 unsupported extension"},
++     "tlsv1 unsupported extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLS_ILLEGAL_EXPORTER_LABEL),
+-    "tls illegal exporter label"},
++     "tls illegal exporter label"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TLS_INVALID_ECPOINTFORMAT_LIST),
+-    "tls invalid ecpointformat list"},
++     "tls invalid ecpointformat list"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TOO_MANY_KEY_UPDATES),
+-    "too many key updates"},
++     "too many key updates"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TOO_MANY_WARN_ALERTS),
+-    "too many warn alerts"},
++     "too many warn alerts"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_TOO_MUCH_EARLY_DATA),
+-    "too much early data"},
++     "too much early data"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNABLE_TO_FIND_ECDH_PARAMETERS),
+-    "unable to find ecdh parameters"},
++     "unable to find ecdh parameters"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNABLE_TO_FIND_PUBLIC_KEY_PARAMETERS),
+-    "unable to find public key parameters"},
++     "unable to find public key parameters"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNABLE_TO_LOAD_SSL3_MD5_ROUTINES),
+-    "unable to load ssl3 md5 routines"},
++     "unable to load ssl3 md5 routines"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNABLE_TO_LOAD_SSL3_SHA1_ROUTINES),
+-    "unable to load ssl3 sha1 routines"},
++     "unable to load ssl3 sha1 routines"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNEXPECTED_CCS_MESSAGE),
+-    "unexpected ccs message"},
++     "unexpected ccs message"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNEXPECTED_END_OF_EARLY_DATA),
+-    "unexpected end of early data"},
++     "unexpected end of early data"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNEXPECTED_EOF_WHILE_READING),
+-    "unexpected eof while reading"},
++     "unexpected eof while reading"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNEXPECTED_MESSAGE), "unexpected message"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNEXPECTED_RECORD), "unexpected record"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNINITIALIZED), "uninitialized"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_ALERT_TYPE), "unknown alert type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_CERTIFICATE_TYPE),
+-    "unknown certificate type"},
++     "unknown certificate type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_CIPHER_RETURNED),
+-    "unknown cipher returned"},
++     "unknown cipher returned"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_CIPHER_TYPE),
+-    "unknown cipher type"},
++     "unknown cipher type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_CMD_NAME), "unknown cmd name"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_COMMAND), "unknown command"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_DIGEST), "unknown digest"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_KEY_EXCHANGE_TYPE),
+-    "unknown key exchange type"},
++     "unknown key exchange type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_MANDATORY_PARAMETER),
+-    "unknown mandatory parameter"},
++     "unknown mandatory parameter"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_PKEY_TYPE), "unknown pkey type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_PROTOCOL), "unknown protocol"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_SSL_VERSION),
+-    "unknown ssl version"},
++     "unknown ssl version"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNKNOWN_STATE), "unknown state"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSAFE_LEGACY_RENEGOTIATION_DISABLED),
+-    "unsafe legacy renegotiation disabled"},
++     "unsafe legacy renegotiation disabled"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSOLICITED_EXTENSION),
+-    "unsolicited extension"},
++     "unsolicited extension"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_COMPRESSION_ALGORITHM),
+-    "unsupported compression algorithm"},
++     "unsupported compression algorithm"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_CONFIG_VALUE),
+-    "unsupported config value"},
++     "unsupported config value"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_CONFIG_VALUE_CLASS),
+-    "unsupported config value class"},
++     "unsupported config value class"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_CONFIG_VALUE_OP),
+-    "unsupported config value op"},
++     "unsupported config value op"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_ELLIPTIC_CURVE),
+-    "unsupported elliptic curve"},
++     "unsupported elliptic curve"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_PROTOCOL),
+-    "unsupported protocol"},
++     "unsupported protocol"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_SSL_VERSION),
+-    "unsupported ssl version"},
++     "unsupported ssl version"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_STATUS_TYPE),
+-    "unsupported status type"},
++     "unsupported status type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_UNSUPPORTED_WRITE_FLAG),
+-    "unsupported write flag"},
++     "unsupported write flag"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_USE_SRTP_NOT_NEGOTIATED),
+-    "use srtp not negotiated"},
++     "use srtp not negotiated"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_VERSION_TOO_HIGH), "version too high"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_VERSION_TOO_LOW), "version too low"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_CERTIFICATE_TYPE),
+-    "wrong certificate type"},
++     "wrong certificate type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_CIPHER_RETURNED),
+-    "wrong cipher returned"},
++     "wrong cipher returned"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_CURVE), "wrong curve"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_RPK_TYPE), "wrong rpk type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_SIGNATURE_LENGTH),
+-    "wrong signature length"},
++     "wrong signature length"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_SIGNATURE_SIZE),
+-    "wrong signature size"},
++     "wrong signature size"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_SIGNATURE_TYPE),
+-    "wrong signature type"},
++     "wrong signature type"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_SSL_VERSION), "wrong ssl version"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_WRONG_VERSION_NUMBER),
+-    "wrong version number"},
++     "wrong version number"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_X509_LIB), "x509 lib"},
+     {ERR_PACK(ERR_LIB_SSL, 0, SSL_R_X509_VERIFICATION_SETUP_PROBLEMS),
+-    "x509 verification setup problems"},
++     "x509 verification setup problems"},
+     {0, NULL}
+ };
+ 
+diff --git a/test/certs/ech-big.pem b/test/certs/ech-big.pem
+new file mode 100644
+index 0000000000..99c9c67bde
+--- /dev/null
++++ b/test/certs/ech-big.pem
+@@ -0,0 +1,25 @@
++-----BEGIN ECHCONFIG-----
++BNj+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBs
++ZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtl
++eGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAAB
++AAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AW
++PAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/Q
++LGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUu
++WkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc
++8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERv
++EyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF
++/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBi
++x2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7
++ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA
++/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUu
++Y29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhh
++bXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQAB
++AAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwA
++BAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxp
++c2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpC
++lg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd
++8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMs
++pDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4R
++CERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA
++-----END ECHCONFIG-----
++
+diff --git a/test/certs/ech-eg.pem b/test/certs/ech-eg.pem
+new file mode 100644
+index 0000000000..4d37f5b17d
+--- /dev/null
++++ b/test/certs/ech-eg.pem
+@@ -0,0 +1,7 @@
++-----BEGIN PRIVATE KEY-----
++MC4CAQAwBQYDK2VuBCIEIKBC3rocwIF5tGY+/TaYQrCxY+ULsch94ja9DojkcvlT
++-----END PRIVATE KEY-----
++-----BEGIN ECHCONFIG-----
++ADn+DQA1agAgACBtuySC1pphjFlGYKTaSm2KWNg7GQVRS8uAYvLTm5QlGwAEAAEA
++AQAGZWcuY29tAAA=
++-----END ECHCONFIG-----
+diff --git a/test/certs/ech-giant.pem b/test/certs/ech-giant.pem
+new file mode 100644
+index 0000000000..d0e5a46c41
+--- /dev/null
++++ b/test/certs/ech-giant.pem
+@@ -0,0 +1,37 @@
++-----BEGIN ECHCONFIG-----
++B8D+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBs
++ZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtl
++eGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAAB
++AAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AW
++PAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/Q
++LGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUu
++WkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc
++8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERv
++EyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF
++/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBi
++x2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7
++ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA
++/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUu
++Y29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhh
++bXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQAB
++AAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwA
++BAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxp
++c2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpC
++lg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd
++8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMs
++pDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4R
++CERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdg
++e/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAg
++ACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4N
++ADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNv
++bQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1w
++bGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQAL
++ZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQA
++AQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNg
++FjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP
++0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFV
++LlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQz
++nPGd8VUuWkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhE
++bxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvy
++xf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA
++-----END ECHCONFIG-----`
+diff --git a/test/certs/ech-mid.pem b/test/certs/ech-mid.pem
+new file mode 100644
+index 0000000000..7c5aa86e14
+--- /dev/null
++++ b/test/certs/ech-mid.pem
+@@ -0,0 +1,11 @@
++-----BEGIN ECHCONFIG-----
++AfD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBs
++ZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtl
++eGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUuWkKWD9AsaXNgFjwABAAB
++AAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc8Z3xVS5aQpYP0Cxpc2AW
++PAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERvEyykM5zxnfFVLlpClg/Q
++LGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA/g0AOrsAIAAgYsdge/LF/hEIRG8TLKQznPGd8VUu
++WkKWD9AsaXNgFjwABAABAAEAC2V4YW1wbGUuY29tAAD+DQA6uwAgACBix2B78sX+EQhEbxMspDOc
++8Z3xVS5aQpYP0Cxpc2AWPAAEAAEAAQALZXhhbXBsZS5jb20AAP4NADq7ACAAIGLHYHvyxf4RCERv
++EyykM5zxnfFVLlpClg/QLGlzYBY8AAQAAQABAAtleGFtcGxlLmNvbQAA
++-----END ECHCONFIG-----
+diff --git a/test/certs/ech-rsa.pem b/test/certs/ech-rsa.pem
+new file mode 100644
+index 0000000000..17b23cf04f
+--- /dev/null
++++ b/test/certs/ech-rsa.pem
+@@ -0,0 +1,14 @@
++-----BEGIN PRIVATE KEY-----
++MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEApeb9fP5SDxyOQZQT
++qGg2QeE0ypxY6Th33aDkRCRVB69rDMSA1Thfeyk65IfaPaA3bC4hsqAIBgslcFfk
++1/i8KQIDAQABAkAsH3EPizwb1MZo3o8T3ROBFfpKYKas8F3Azgenr9oFfs5kPgya
++VDdtZu+UweG5nTo+fZG5ZFmcwWXJTLtiUfABAiEAz2gvTuc0lPTQi3t6RFB5nGCt
++h75Ofx/ceusHa2a36QECIQDMxXJQnuWY+bH/wSfPY/ySltQ6U2cy0LHQ37FIfSFr
++KQIgUo++hUI0BDeP7HYyrY77WeyCJ07yIFimg6ebRH2XKAECIQCSavhTd1q6qIhD
++VMzveRInixvTXMGkzx7mOJzeNUMJCQIhAJjjVdRjUpWPMquRDCddmwegh88ptsFX
++T/Ygm1OubAyM
++-----END PRIVATE KEY-----
++-----BEGIN ECHCONFIG-----
++AD7+DQA6bAAgACCY7B0f/3KvHIFdoqFaObdU8YYU+MdBf4vzbLhAAL2QCwAEAAEA
++AQALZXhhbXBsZS5jb20AAA==
++-----END ECHCONFIG-----
+diff --git a/test/ech_test.c b/test/ech_test.c
+index 2e49b6b0c9..e491740ecd 100644
+--- a/test/ech_test.c
++++ b/test/ech_test.c
+@@ -14,7 +14,679 @@
+ 
+ #ifndef OPENSSL_NO_ECH
+ 
++# define DEF_CERTS_DIR "test/certs"
++
+ static int verbose = 0;
++static char *certsdir = NULL;
++
++/* general test vector values */
++
++/* standard x25519 ech key pair with public key example.com */
++static const char pem_kp1[] =
++    "-----BEGIN PRIVATE KEY-----\n"
++    "MC4CAQAwBQYDK2VuBCIEILDIeo9Eqc4K9/uQ0PNAyMaP60qrxiSHT2tNZL3ksIZS\n"
++    "-----END PRIVATE KEY-----\n"
++    "-----BEGIN ECHCONFIG-----\n"
++    "AD7+DQA6bAAgACCY7B0f/3KvHIFdoqFaObdU8YYU+MdBf4vzbLhAAL2QCwAEAAEA\n"
++    "AQALZXhhbXBsZS5jb20AAA==\n"
++    "-----END ECHCONFIG-----\n";
++
++/* standard x25519 ECHConfigList with public key example.com */
++static const char pem_pk1[] =
++    "-----BEGIN ECHCONFIG-----\n"
++    "AD7+DQA6bAAgACCY7B0f/3KvHIFdoqFaObdU8YYU+MdBf4vzbLhAAL2QCwAEAAEA\n"
++    "AQALZXhhbXBsZS5jb20AAA==\n"
++    "-----END ECHCONFIG-----\n";
++
++/* an ECDSA private with an x25519 ech public key example.com */
++static const char pem_mismatch_priv[] =
++    "-----BEGIN EC PRIVATE KEY-----\n"
++    "MHcCAQEEIGKONznbHOMEKT4AKMufc37O9lUEBHO+Nb6ztkXhGXLcoAoGCCqGSM49\n"
++    "AwEHoUQDQgAEYDznfezvj5ufhQsZOQvSdiNpYKCd8tRI1aI3gc4y7gmdDUKpwzHa\n"
++    "VS4Qq0xyeG6fDMJv668UCotQANFsifGirQ==\n"
++    "-----END EC PRIVATE KEY-----\n"
++    "-----BEGIN ECHCONFIG-----\n"
++    "AD7+DQA6bAAgACCY7B0f/3KvHIFdoqFaObdU8YYU+MdBf4vzbLhAAL2QCwAEAAEA\n"
++    "AQALZXhhbXBsZS5jb20AAA==\n"
++    "-----END ECHCONFIG-----\n";
++
++/*
++ * This ECHConfigList has 4 entries with different versions,
++ * from drafts: 13,10,13,9 - since our runtime no longer supports
++ * version 9 or 10, we should see 2 configs loaded.
++ */
++static const char pem_4_to_2[] =
++    "-----BEGIN ECHCONFIG-----\n"
++    "APv+DQA6xQAgACBm54KSIPXu+pQq2oY183wt3ybx7CKbBYX0ogPq5u6FegAEAAEA\n"
++    "AQALZXhhbXBsZS5jb20AAP4KADzSACAAIIP+0Qt0WGBF3H5fz8HuhVRTCEMuHS4K\n"
++    "hu6ibR/6qER4AAQAAQABAAAAC2V4YW1wbGUuY29tAAD+DQA6QwAgACB3xsNUtSgi\n"
++    "piYpUkW6OSrrg03I4zIENMFa0JR2+Mm1WwAEAAEAAQALZXhhbXBsZS5jb20AAP4J\n"
++    "ADsAC2V4YW1wbGUuY29tACCjJCv5w/yaHjbOc6nVuM/GksIGLgDR+222vww9dEk8\n"
++    "FwAgAAQAAQABAAAAAA==\n"
++    "-----END ECHCONFIG-----\n";
++
++/* mis-spelled PEM string */
++static const char pem_typo[] =
++    "-----BEGIN PRIVATE KEY-----\n"
++    "MC4CAQAwBQYDK2VuBCIEILDIeo9Eqc4K9/uQ0PNAyMaP60qrxiSHT2tNZL3ksIZS\n"
++    "-----END PRIVATE KEY-----\n"
++    "-----BEGIN ExHCOxFIG-----\n"
++    "AD7+DQA6bAAgACCY7B0f/3KvHIFdoqFaObdU8YYU+MdBf4vzbLhAAL2QCwAEAAEA\n"
++    "AQALZXhhbXBsZS5jb20AAA==\n"
++    "-----END ExHCOxFIG-----\n";
++
++/* single-line base64(ECHConfigList) form of pem_pk1 */
++static const char b64_pk1[] =
++    "AD7+DQA6bAAgACCY7B0f/3KvHIFdoqFaObdU8YYU+MdBf4vzbLhAAL2QCwAEAAEA"
++    "AQALZXhhbXBsZS5jb20AAA==";
++
++/* single-line base64(ECHConfigList) form of pem_6_to3 */
++static const char b64_6_to_3[] =
++    "AXn+DQA6xQAgACBm54KSIPXu+pQq2oY183wt3ybx7CKbBYX0ogPq5u6FegAEAAE"
++    "AAQALZXhhbXBsZS5jb20AAP4KADzSACAAIIP+0Qt0WGBF3H5fz8HuhVRTCEMuHS"
++    "4Khu6ibR/6qER4AAQAAQABAAAAC2V4YW1wbGUuY29tAAD+CQA7AAtleGFtcGxlL"
++    "mNvbQAgoyQr+cP8mh42znOp1bjPxpLCBi4A0ftttr8MPXRJPBcAIAAEAAEAAQAA"
++    "AAD+DQA6QwAgACB3xsNUtSgipiYpUkW6OSrrg03I4zIENMFa0JR2+Mm1WwAEAAE"
++    "AAQALZXhhbXBsZS5jb20AAP4KADwDACAAIH0BoAdiJCX88gv8nYpGVX5BpGBa9y"
++    "T0Pac3Kwx6i8URAAQAAQABAAAAC2V4YW1wbGUuY29tAAD+DQA6QwAgACDcZIAx7"
++    "OcOiQuk90VV7/DO4lFQr5I3Zw9tVbK8MGw1dgAEAAEAAQALZXhhbXBsZS5jb20A"
++    "AA==";
++
++/* same as above but binary encoded */
++static const unsigned char bin_6_to_3[] = {
++    0x01, 0x79, 0xfe, 0x0d, 0x00, 0x3a, 0xc5, 0x00,
++    0x20, 0x00, 0x20, 0x66, 0xe7, 0x82, 0x92, 0x20,
++    0xf5, 0xee, 0xfa, 0x94, 0x2a, 0xda, 0x86, 0x35,
++    0xf3, 0x7c, 0x2d, 0xdf, 0x26, 0xf1, 0xec, 0x22,
++    0x9b, 0x05, 0x85, 0xf4, 0xa2, 0x03, 0xea, 0xe6,
++    0xee, 0x85, 0x7a, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00,
++    0xfe, 0x0a, 0x00, 0x3c, 0xd2, 0x00, 0x20, 0x00,
++    0x20, 0x83, 0xfe, 0xd1, 0x0b, 0x74, 0x58, 0x60,
++    0x45, 0xdc, 0x7e, 0x5f, 0xcf, 0xc1, 0xee, 0x85,
++    0x54, 0x53, 0x08, 0x43, 0x2e, 0x1d, 0x2e, 0x0a,
++    0x86, 0xee, 0xa2, 0x6d, 0x1f, 0xfa, 0xa8, 0x44,
++    0x78, 0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00,
++    0x00, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00,
++    0xfe, 0x09, 0x00, 0x3b, 0x00, 0x0b, 0x65, 0x78,
++    0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f,
++    0x6d, 0x00, 0x20, 0xa3, 0x24, 0x2b, 0xf9, 0xc3,
++    0xfc, 0x9a, 0x1e, 0x36, 0xce, 0x73, 0xa9, 0xd5,
++    0xb8, 0xcf, 0xc6, 0x92, 0xc2, 0x06, 0x2e, 0x00,
++    0xd1, 0xfb, 0x6d, 0xb6, 0xbf, 0x0c, 0x3d, 0x74,
++    0x49, 0x3c, 0x17, 0x00, 0x20, 0x00, 0x04, 0x00,
++    0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xfe,
++    0x0d, 0x00, 0x3a, 0x43, 0x00, 0x20, 0x00, 0x20,
++    0x77, 0xc6, 0xc3, 0x54, 0xb5, 0x28, 0x22, 0xa6,
++    0x26, 0x29, 0x52, 0x45, 0xba, 0x39, 0x2a, 0xeb,
++    0x83, 0x4d, 0xc8, 0xe3, 0x32, 0x04, 0x34, 0xc1,
++    0x5a, 0xd0, 0x94, 0x76, 0xf8, 0xc9, 0xb5, 0x5b,
++    0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x0b,
++    0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e,
++    0x63, 0x6f, 0x6d, 0x00, 0x00, 0xfe, 0x0a, 0x00,
++    0x3c, 0x03, 0x00, 0x20, 0x00, 0x20, 0x7d, 0x01,
++    0xa0, 0x07, 0x62, 0x24, 0x25, 0xfc, 0xf2, 0x0b,
++    0xfc, 0x9d, 0x8a, 0x46, 0x55, 0x7e, 0x41, 0xa4,
++    0x60, 0x5a, 0xf7, 0x24, 0xf4, 0x3d, 0xa7, 0x37,
++    0x2b, 0x0c, 0x7a, 0x8b, 0xc5, 0x11, 0x00, 0x04,
++    0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0b,
++    0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e,
++    0x63, 0x6f, 0x6d, 0x00, 0x00, 0xfe, 0x0d, 0x00,
++    0x3a, 0x43, 0x00, 0x20, 0x00, 0x20, 0xdc, 0x64,
++    0x80, 0x31, 0xec, 0xe7, 0x0e, 0x89, 0x0b, 0xa4,
++    0xf7, 0x45, 0x55, 0xef, 0xf0, 0xce, 0xe2, 0x51,
++    0x50, 0xaf, 0x92, 0x37, 0x67, 0x0f, 0x6d, 0x55,
++    0xb2, 0xbc, 0x30, 0x6c, 0x35, 0x76, 0x00, 0x04,
++    0x00, 0x01, 0x00, 0x01, 0x00, 0x0b, 0x65, 0x78,
++    0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f,
++    0x6d, 0x00, 0x00
++};
++
++/* base64(ECHConfigList) with corrupt ciphersuite length and public_name */
++static const char b64_bad_cs[] =
++    "AD7+DQA6uAAgACAogff+HZbirYdQCfXI01GBPP8AEKYyK/D/0DoeXD84fgAQAAE"
++    "AAQgLZXhhbUNwbGUuYwYAAAAAQwA=";
++
++/* An ECHConfigList with one ECHConfig but of the wrong version */
++static const unsigned char bin_bad_ver[] = {
++    0x00, 0x3e, 0xfe, 0xff, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/*
++ * An ECHConflgList with 2 ECHConfig values that are both
++ * of the wrong version. The versions here are 0xfe03 (we
++ * currently support only 0xfe0d)
++ */
++static const unsigned char bin_bad_ver2[] = {
++    0x00, 0x80, 0xfe, 0x03, 0x00, 0x3c, 0x00, 0x00,
++    0x20, 0x00, 0x20, 0x71, 0xa5, 0xe0, 0xb4, 0x6d,
++    0xdf, 0xa4, 0xda, 0xed, 0x69, 0xa5, 0xc7, 0x8b,
++    0x9d, 0xa5, 0x13, 0x0c, 0x36, 0x83, 0x7a, 0x03,
++    0x72, 0x1d, 0xf6, 0x1e, 0xc5, 0x83, 0x1a, 0x11,
++    0x73, 0xce, 0x2d, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0d, 0x70, 0x61, 0x72, 0x74, 0x31,
++    0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
++    0x00, 0x00, 0xfe, 0x03, 0x00, 0x3c, 0x00, 0x00,
++    0x20, 0x00, 0x20, 0x69, 0x88, 0xfd, 0x8f, 0xc9,
++    0x0b, 0xb7, 0x2d, 0x96, 0x6d, 0xe0, 0x22, 0xf0,
++    0xc8, 0x1b, 0x62, 0x2b, 0x1c, 0x94, 0x96, 0xad,
++    0xef, 0x55, 0xdb, 0x9f, 0xeb, 0x0d, 0xa1, 0x4b,
++    0x0c, 0xd7, 0x36, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0d, 0x70, 0x61, 0x72, 0x74, 0x32,
++    0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
++    0x00, 0x00
++};
++
++/*
++ * An ECHConfigList with one ECHConfig with an all-zero public value.
++ * That should be ok, for 25519, but hey, just in case:-)
++ */
++static const unsigned char bin_zero[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/*
++ * The next set of samples are syntactically invalid
++ * Proper fuzzing is still needed but no harm having
++ * these too. Generally these are bad version of
++ * our nominal encoding with some octet(s) replaced
++ * by 0xFF values. Other hex letters are lowercase
++ * so you can find the altered octet(s).
++ */
++
++/* wrong overall length (replacing 0x3e with 0xFF) */
++static const unsigned char bin_bad_olen[] = {
++    0x00, 0xFF, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0xFF, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* wrong ECHConfig inner length (replacing 0x3a with 0xFF) */
++static const unsigned char bin_bad_ilen[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0xFF, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* wrong length for public key (replaced 0x20 with 0xFF) */
++static const unsigned char bin_bad_pklen[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0xFF, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* wrong length for ciphersuites (replaced 0x04 with 0xFF) */
++static const unsigned char bin_bad_cslen[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0xFF, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* wrong length for public name (replaced 0x0b with 0xFF) */
++static const unsigned char bin_bad_pnlen[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0xFF, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* non-zero extension length (0xFF at end) but no extension value */
++static const unsigned char bin_bad_extlen[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0xFF
++};
++
++/*
++ * The next set have bad kem, kdf or aead values - this time with
++ * 0xAA as the replacement value
++ */
++
++/* wrong KEM ID (replaced 0x20 with 0xAA) */
++static const unsigned char bin_bad_kemid[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0xAA, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* wrong KDF ID (replaced 0x01 with 0xAA) */
++static const unsigned char bin_bad_kdfid[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0xAA, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* wrong AEAD ID (replaced 0x01 with 0xAA) */
++static const unsigned char bin_bad_aeadid[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0xAA, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* ECHConfig supports two symmetric suites */
++static const unsigned char bin_multi_suite[] = {
++    0x00, 0x42, 0xfe, 0x0d, 0x00, 0x3e, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x08, 0x00, 0x01, 0x00,
++    0x01,
++    0x00, 0x02, 0x00, 0x02,
++    0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/*
++ * sorta wrong AEAD ID; replaced 0x0001 with 0xFFFF
++ * which is the export only pseudo-aead-id - that
++ * should not work in our test, same as the others,
++ * but worth a specific test, as it'll fail in a
++ * different manner
++ */
++static const unsigned char bin_bad_aeadid_ff[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0xFF,
++    0xFF, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/*
++ * An ECHConfigList with a bad ECHConfig
++ * (aead is 0xFFFF), followed by a good
++ * one.
++ */
++static const unsigned char bin_bad_then_good[] = {
++    0x00, 0x7c, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0xFF,
++    0xFF, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00,
++    0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00, 0x20, 0x00,
++    0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2, 0xc5, 0xfe,
++    0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c, 0xa4, 0x33,
++    0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e, 0x5a, 0x42,
++    0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73, 0x60, 0x16,
++    0x3c, 0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00,
++    0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
++    0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* couple of harmless extensions */
++static const unsigned char bin_ok_exts[] = {
++    0x00, 0x47, 0xfe, 0x0d, 0x00, 0x43, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x09,
++    0x0a, 0x0b, 0x00, 0x00, 0x0c, 0x0d, 0x00, 0x01,
++    0x02
++};
++
++/* one "mandatory" extension (high bit of type set) */
++static const unsigned char bin_mand_ext[] = {
++    0x00, 0x47, 0xfe, 0x0d, 0x00, 0x43, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x09,
++    0x0a, 0x0b, 0x00, 0x00, 0xFc, 0x0d, 0x00, 0x01,
++    0x02
++};
++
++/* extension with bad length (0xFFFF) */
++static const unsigned char bin_bad_inner_extlen[] = {
++    0x00, 0x47, 0xfe, 0x0d, 0x00, 0x43, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x09,
++    0x0a, 0x0b, 0x00, 0x00, 0x0c, 0x0d, 0x00, 0xFF,
++    0x02
++};
++
++/* good, other than a NUL inside the public_name */
++static const unsigned char bin_nul_in_pn[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x00, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* good, other than a dot at the end of the public_name */
++static const unsigned char bin_pn_dot_at_end[] = {
++    0x00, 0x3e, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x2e, 0x00, 0x00
++};
++
++/*
++ * An ECHConfigList with a good ECHConfig followed by a bad
++ * one with the 1st internal length (0xFFFF) too big
++ */
++static const unsigned char bin_good_then_bad[] = {
++    0x00, 0x7c, 0xfe, 0x0d, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00,
++    0xfe, 0x0d, 0xFF, 0xFF, 0xbb, 0x00, 0x20, 0x00,
++    0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2, 0xc5, 0xfe,
++    0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c, 0xa4, 0x33,
++    0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e, 0x5a, 0x42,
++    0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73, 0x60, 0x16,
++    0x3c, 0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00,
++    0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
++    0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00
++};
++
++/* generally very short:-) */
++static const unsigned char bin_short[] = {
++    0x00, 0x05, 0xfe, 0x0d, 0x00, 0x01, 0x01
++};
++
++/* kind of an empty value */
++static const unsigned char bin_empty[] = {
++    0x00, 0x00
++};
++
++/*
++ * An ECHConfigList with an unsupported ECHConfig and
++ * that's too short.
++ */
++static const unsigned char bin_ver_short[] = {
++    0x00, 0x3e, 0xfe, 0xFF, 0x00, 0x3a, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/*
++ * too-long extension - OSSL_ECH_MAX_ECHCONFIGEXT_LEN is
++ * 512, this is 513 (0x0201), end of the 8-th line
++ * */
++static const unsigned char bin_long_ext[] = {
++    0x02, 0x43, 0xfe, 0x0d, 0x02, 0x3f, 0xbb, 0x00,
++    0x20, 0x00, 0x20, 0x62, 0xc7, 0x60, 0x7b, 0xf2,
++    0xc5, 0xfe, 0x11, 0x08, 0x44, 0x6f, 0x13, 0x2c,
++    0xa4, 0x33, 0x9c, 0xf1, 0x9d, 0xf1, 0x55, 0x2e,
++    0x5a, 0x42, 0x96, 0x0f, 0xd0, 0x2c, 0x69, 0x73,
++    0x60, 0x16, 0x3c, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70,
++    0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x02, 0x05,
++    0xFF, 0xFF, 0x02, 0x01,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00
++};
++
++/* struct for ingest test vector and results */
++typedef struct INGEST_TV_T {
++    char *name; /* name for verbose output */
++    const unsigned char *tv; /* test vector */
++    size_t len; /* len(tv) - sizeof(tv) if binary, subtract 1 for strings */
++    int pemenc; /* whether PEM encoded (1) or not (0) */
++    int read; /* result expected from read function on tv */
++    int keysb4; /* the number of private keys expected before downselect */
++    int entsb4; /* the number of public keys b4 */
++    int index; /* the index to use for downselect */
++    int expected; /* the result expected from a downselect */
++    int keysaftr; /* the number of keys expected after downselect */
++    int entsaftr; /* the number of public keys after */
++} ingest_tv_t;
++
++static ingest_tv_t ingest_tvs[] = {
++    /* PEM test vectors */
++    { "PEM basic/last", (unsigned char *)pem_kp1, sizeof(pem_kp1) - 1,
++      1, 1, 1, 1, OSSL_ECHSTORE_LAST, 1, 1, 1 },
++    { "PEM basic/0", (unsigned char *)pem_pk1, sizeof(pem_pk1) - 1,
++      1, 1, 0, 1, 0, 1, 0, 1 },
++    { "PEM basic/2nd", (unsigned char *)pem_pk1, sizeof(pem_pk1) - 1,
++      1, 1, 0, 1, 2, 0, 0, 1 },
++    { "ECDSA priv + 25519 pub", (unsigned char *)pem_mismatch_priv,
++      sizeof(pem_mismatch_priv) - 1,
++      1, 0, 0, 0, 0, 0, 0, 0 },
++    { "PEM string typo", (unsigned char *)pem_typo, sizeof(pem_typo) - 1,
++      1, 0, 0, 0, 0, 0, 0, 0 },
++    /* downselect from the 2, at each position */
++    { "PEM 4->2/0", (unsigned char *)pem_4_to_2, sizeof(pem_4_to_2) - 1,
++      1, 1, 0, 2, 0, 1, 0, 1 },
++    { "PEM 4->2/1", (unsigned char *)pem_4_to_2, sizeof(pem_4_to_2) - 1,
++      1, 1, 0, 2, 1, 1, 0, 1 },
++    /* in the next one below, downselect fails, so we still have 2 entries */
++    { "PEM 4->2/2", (unsigned char *)pem_4_to_2, sizeof(pem_4_to_2) - 1,
++      1, 1, 0, 2, 3, 0, 0, 2 },
++    /* b64 test vectors */
++    { "B64 basic/last", (unsigned char *)b64_pk1, sizeof(b64_pk1) - 1,
++      0, 1, 0, 1, OSSL_ECHSTORE_LAST, 1, 0, 1 },
++    { "B64 6->3/2", (unsigned char *)b64_6_to_3, sizeof(b64_6_to_3) - 1,
++      0, 1, 0, 3, 2, 1, 0, 1 },
++    { "B64 bad suitelen", (unsigned char *)b64_bad_cs, sizeof(b64_bad_cs) - 1,
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    /* binary test vectors */
++    { "bin 6->3/2", (unsigned char *)bin_6_to_3, sizeof(bin_6_to_3),
++      0, 1, 0, 3, 2, 1, 0, 1 },
++    { "bin 2 symm suites", (unsigned char *)bin_multi_suite,
++      sizeof(bin_multi_suite),
++      0, 1, 0, 1, OSSL_ECHSTORE_LAST, 1, 0, 1 },
++    { "bin all-zero pub", (unsigned char *)bin_zero, sizeof(bin_zero),
++      0, 1, 0, 1, OSSL_ECHSTORE_LAST, 1, 0, 1 },
++    { "bin ok exts", (unsigned char *)bin_ok_exts, sizeof(bin_ok_exts),
++      0, 1, 0, 1, OSSL_ECHSTORE_LAST, 1, 0, 1 },
++    { "bin bad ver", (unsigned char *)bin_bad_ver, sizeof(bin_bad_ver),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin 2 bad ver", (unsigned char *)bin_bad_ver2, sizeof(bin_bad_ver2),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad len", (unsigned char *)bin_bad_olen, sizeof(bin_bad_olen),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad inner len", (unsigned char *)bin_bad_ilen, sizeof(bin_bad_ilen),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad pk len", (unsigned char *)bin_bad_pklen, sizeof(bin_bad_pklen),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad suitelen", (unsigned char *)bin_bad_cslen, sizeof(bin_bad_cslen),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad pn len", (unsigned char *)bin_bad_pnlen, sizeof(bin_bad_pnlen),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad extlen", (unsigned char *)bin_bad_extlen, sizeof(bin_bad_extlen),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad kemid", (unsigned char *)bin_bad_kemid, sizeof(bin_bad_kemid),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad kdfid", (unsigned char *)bin_bad_kdfid, sizeof(bin_bad_kdfid),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad aeadid", (unsigned char *)bin_bad_aeadid, sizeof(bin_bad_aeadid),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin exp aeadid", (unsigned char *)bin_bad_aeadid_ff,
++      sizeof(bin_bad_aeadid_ff),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad,good", (unsigned char *)bin_bad_then_good,
++      sizeof(bin_bad_then_good),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin mand ext", (unsigned char *)bin_mand_ext, sizeof(bin_mand_ext),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin bad inner extlen", (unsigned char *)bin_bad_inner_extlen,
++      sizeof(bin_bad_inner_extlen),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin NUL in PN", (unsigned char *)bin_nul_in_pn, sizeof(bin_nul_in_pn),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin PN ends in dot", (unsigned char *)bin_pn_dot_at_end,
++      sizeof(bin_pn_dot_at_end),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin short", (unsigned char *)bin_short, sizeof(bin_short),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin empty", (unsigned char *)bin_empty, sizeof(bin_empty),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin ver short", (unsigned char *)bin_ver_short, sizeof(bin_ver_short),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin long ext", (unsigned char *)bin_long_ext, sizeof(bin_long_ext),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++    { "bin good then bad", (unsigned char *)bin_good_then_bad,
++      sizeof(bin_good_then_bad),
++      0, 0, 0, 0, 0, 0, 0, 0 },
++};
++
++/* similar, but slightly simpler setup for file reading tests */
++typedef struct FNT_T {
++    char *fname; /* relative file name */
++    int read; /* expected result from a pem_read of that */
++} fnt_t;
++
++static fnt_t fnames[] = {
++    { "ech-eg.pem", 1 },
++    { "ech-mid.pem", 1 },
++    { "ech-big.pem", 1 },
++    { "ech-giant.pem", 0 },
++    { "ech-rsa.pem", 0 },
++};
+ 
+ typedef enum OPTION_choice {
+     OPT_ERR = -1,
+@@ -34,6 +706,332 @@ const OPTIONS *test_get_options(void)
+     return test_options;
+ }
+ 
++/*
++ * For the relevant test vector in our array above:
++ * - try decode
++ * - if not expected to decode, we're done
++ * - check we got the right number of keys/ECHConfig values
++ * - do some calls with getting info, downselecting etc. and
++ *   check results as expected
++ * - do a write_pem call on the results
++ * - flush keys 'till now and check they're all gone
++ */
++static int ech_ingest_test(int run)
++{
++    OSSL_ECHSTORE *es = NULL;
++    OSSL_ECH_INFO *ei = NULL;
++    BIO *in = NULL, *out = NULL;
++    int i, rv = 0, keysb4, keysaftr, actual_ents = 0;
++    ingest_tv_t *tv = &ingest_tvs[run];
++    time_t now = 0;
++
++    if ((in = BIO_new(BIO_s_mem())) == NULL
++        || BIO_write(in, tv->tv, tv->len) <= 0
++        || (out = BIO_new(BIO_s_mem())) == NULL
++        || (es = OSSL_ECHSTORE_new(NULL, NULL)) == NULL)
++        goto end;
++    if (verbose)
++        TEST_info("Iteration: %d %s", run + 1, tv->name);
++    /* just in case of bad edits to table */
++    if (tv->pemenc != 1 && tv->pemenc != 0) {
++        TEST_info("Bad test vector entry");
++        goto end;
++    }
++    if (tv->pemenc == 1
++        && !TEST_int_eq(OSSL_ECHSTORE_read_pem(es, in, OSSL_ECH_NO_RETRY),
++                        tv->read)) {
++        TEST_info("OSSL_ECHSTORE_read_pem unexpected result");
++        goto end;
++    }
++    if (tv->pemenc != 1
++        && !TEST_int_eq(OSSL_ECHSTORE_read_echconfiglist(es, in),
++                        tv->read)) {
++        TEST_info("OSSL_ECHSTORE_read_echconfiglist unexpected result");
++        goto end;
++    }
++    /* if we provided a deliberately bad tv then we're done */
++    if (tv->read != 1) {
++        rv = 1;
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_num_keys(es, &keysb4), 1)) {
++        TEST_info("OSSL_ECHSTORE_num_keys unexpected fail");
++        goto end;
++    }
++    if (!TEST_int_eq(keysb4, tv->keysb4)) {
++        TEST_info("OSSL_ECHSTORE_num_keys unexpected number of keys (b4)");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_get1_info(es, &ei, &actual_ents), 1)) {
++        TEST_info("OSSL_ECHSTORE_get1_info unexpected fail");
++        goto end;
++    }
++    for (i = 0; i != actual_ents; i++) {
++        if (!TEST_int_eq(OSSL_ECH_INFO_print(bio_err, ei, i), 1)) {
++            TEST_info("OSSL_ECH_INFO_print unexpected fail");
++            OSSL_ECH_INFO_free(ei, actual_ents);
++            goto end;
++        }
++    }
++    if (!TEST_int_eq(actual_ents, tv->entsb4)) {
++        TEST_info("OSSL_ECHSTORE_get1_info unexpected number of entries (b4)");
++        goto end;
++    }
++    OSSL_ECH_INFO_free(ei, actual_ents);
++    ei = NULL;
++    /* ensure silly index fails ok */
++    if (!TEST_int_eq(OSSL_ECHSTORE_downselect(es, -20), 0)) {
++        TEST_info("OSSL_ECHSTORE_downselect unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_downselect(es, tv->index), tv->expected)) {
++        TEST_info("OSSL_ECHSTORE_downselect unexpected result");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_num_keys(es, &keysaftr), 1)) {
++        TEST_info("OSSL_ECHSTORE_num_keys unexpected fail");
++        goto end;
++    }
++    if (!TEST_int_eq(keysaftr, tv->keysaftr)) {
++        TEST_info("OSSL_ECHSTORE_num_keys unexpected number of keys (aftr)");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_get1_info(es, &ei, &actual_ents), 1)) {
++        TEST_info("OSSL_ECHSTORE_get1_info unexpected fail");
++        goto end;
++    }
++    OSSL_ECH_INFO_free(ei, actual_ents);
++    ei = NULL;
++    if (!TEST_int_eq(actual_ents, tv->entsaftr)) {
++        TEST_info("OSSL_ECHSTORE_get1_info unexpected number of entries (aftr)");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_write_pem(es, OSSL_ECHSTORE_ALL, out), 1)) {
++        TEST_info("OSSL_ECHSTORE_write_pem unexpected fail");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_write_pem(es, 100, out), 0)) {
++        TEST_info("OSSL_ECHSTORE_write_pem unexpected result");
++        goto end;
++    }
++    now = time(0);
++    if (!TEST_int_eq(OSSL_ECHSTORE_flush_keys(es, now), 1)) {
++        TEST_info("OSSL_ECHSTORE_flush_keys unexpected fail");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_num_keys(es, &keysaftr), 1)) {
++        TEST_info("OSSL_ECHSTORE_num_keys unexpected fail");
++        goto end;
++    }
++    if (!TEST_int_eq(keysaftr, 0)) {
++        TEST_info("OSSL_ECHSTORE_flush_keys unexpected non-zero");
++        goto end;
++    }
++    rv = 1;
++end:
++    OSSL_ECH_INFO_free(ei, actual_ents);
++    OSSL_ECHSTORE_free(es);
++    BIO_free_all(in);
++    BIO_free_all(out);
++    return rv;
++}
++
++/* make a bunch of calls with bad, mostly NULL, arguments */
++static int ech_store_null_calls(void)
++{
++    int rv = 0, count = 0;
++    OSSL_ECHSTORE *es = OSSL_ECHSTORE_new(NULL, NULL);
++    OSSL_HPKE_SUITE hpke_suite = OSSL_HPKE_SUITE_DEFAULT;
++    BIO *inout = BIO_new(BIO_s_mem());
++    OSSL_ECH_INFO *info = NULL;
++    EVP_PKEY *priv = EVP_PKEY_new();
++
++    OSSL_ECHSTORE_free(NULL);
++    if (!TEST_int_eq(OSSL_ECHSTORE_new_config(NULL, OSSL_ECH_CURRENT_VERSION,
++                                              0, "example.com", hpke_suite),
++                     0)) {
++        TEST_info("OSSL_ECHSTORE_new_config unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_new_config(es, OSSL_ECH_CURRENT_VERSION,
++                                              0, NULL, hpke_suite),
++                     0)) {
++        TEST_info("OSSL_ECHSTORE_new_config unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_new_config(es, 0xffff,
++                                              0, "example.com", hpke_suite),
++                     0)) {
++        TEST_info("OSSL_ECHSTORE_new_config unexpected non-zero");
++        goto end;
++    }
++    hpke_suite.kdf_id = 0xAAAA; /* a bad value */
++    if (!TEST_int_eq(OSSL_ECHSTORE_new_config(es, OSSL_ECH_CURRENT_VERSION,
++                                              0, "example.com", hpke_suite),
++                     0)) {
++        TEST_info("OSSL_ECHSTORE_new_config unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_write_pem(NULL, 0, inout), 0)) {
++        TEST_info("OSSL_ECHSTORE_write_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_write_pem(es, 0, NULL), 0)) {
++        TEST_info("OSSL_ECHSTORE_write_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_write_pem(es, 100, inout), 0)) {
++        TEST_info("OSSL_ECHSTORE_write_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_read_echconfiglist(NULL, inout), 0)) {
++        TEST_info("OSSL_ECHSTORE_read_echconfiglist unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_read_echconfiglist(es, NULL), 0)) {
++        TEST_info("OSSL_ECHSTORE_read_echconfiglist unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_get1_info(NULL, &info, &count), 0)) {
++        TEST_info("OSSL_ECHSTORE_get1_info unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_get1_info(es, NULL, &count), 0)) {
++        TEST_info("OSSL_ECHSTORE_get1_info unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_get1_info(es, &info, NULL), 0)) {
++        TEST_info("OSSL_ECHSTORE_get1_info unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_get1_info(es, &info, &count), 1)) {
++        TEST_info("OSSL_ECHSTORE_get1_info unexpected zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_downselect(NULL, 0), 0)) {
++        TEST_info("OSSL_ECHSTORE_downselect unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_downselect(es, 100), 0)) {
++        TEST_info("OSSL_ECHSTORE_downselect unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_set1_key_and_read_pem(NULL, priv,
++                                                         inout, 0), 0)) {
++        TEST_info("OSSL_ECHSTORE_set1_key_and_readp_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_set1_key_and_read_pem(es, NULL,
++                                                         inout, 0), 0)) {
++        TEST_info("OSSL_ECHSTORE_set1_key_and_readp_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_set1_key_and_read_pem(es, priv,
++                                                         NULL, 0), 0)) {
++        TEST_info("OSSL_ECHSTORE_set1_key_and_readp_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_set1_key_and_read_pem(es, priv,
++                                                         inout, 100), 0)) {
++        TEST_info("OSSL_ECHSTORE_set1_key_and_readp_pem unexpected non-zero");
++        goto end;
++    }
++    /* this one fails 'cause priv has no real value, even if non NULL */
++    if (!TEST_int_eq(OSSL_ECHSTORE_set1_key_and_read_pem(es, priv, inout,
++                                                         OSSL_ECH_NO_RETRY),
++                     0)) {
++        TEST_info("OSSL_ECHSTORE_set1_key_and_readp_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_read_pem(NULL, inout, OSSL_ECH_NO_RETRY), 0)) {
++        TEST_info("OSSL_ECHSTORE_read_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_read_pem(es, NULL, OSSL_ECH_NO_RETRY), 0)) {
++        TEST_info("OSSL_ECHSTORE_read_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_read_pem(es, inout, 100), 0)) {
++        TEST_info("OSSL_ECHSTORE_read_pem unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_num_keys(NULL, &count), 0)) {
++        TEST_info("OSSL_ECHSTORE_num_keys unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_num_keys(es, NULL), 0)) {
++        TEST_info("OSSL_ECHSTORE_num_keys unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_flush_keys(NULL, 0), 0)) {
++        TEST_info("OSSL_ECHSTORE_flush_keys unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_flush_keys(es, -1), 0)) {
++        TEST_info("OSSL_ECHSTORE_flush_keys unexpected non-zero");
++        goto end;
++    }
++    /* check free NULL is ok */
++    OSSL_ECH_INFO_free(NULL, 100);
++    if (!TEST_int_eq(OSSL_ECH_INFO_print(inout, NULL, -1), 0)) {
++        TEST_info("OSSL_ECHSTORE_flush_keys unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECH_INFO_print(NULL, info, -1), 0)) {
++        TEST_info("OSSL_ECHSTORE_flush_keys unexpected non-zero");
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECH_INFO_print(inout, info, 0), 0)) {
++        TEST_info("OSSL_ECHSTORE_flush_keys unexpected non-zero");
++        goto end;
++    }
++    rv = 1;
++end:
++    OSSL_ECH_INFO_free(info, count);
++    OSSL_ECHSTORE_free(es);
++    BIO_free_all(inout);
++    EVP_PKEY_free(priv);
++    return rv;
++}
++
++/* read some files, some that work, some that fail */
++static int ech_test_file_read(int run)
++{
++    int rv = 0;
++    OSSL_ECHSTORE *es = NULL;
++    BIO *in = NULL;
++    fnt_t *ft = &fnames[run];
++    char *fullname = NULL;
++    size_t fnlen = 0;
++
++    es = OSSL_ECHSTORE_new(NULL, NULL);
++    if (es == NULL)
++        goto end;
++    fnlen = strlen(certsdir) + 1 + strlen(ft->fname) + 1;
++    fullname = OPENSSL_malloc(fnlen);
++    if (fullname == NULL)
++        goto end;
++    snprintf(fullname, fnlen, "%s/%s", certsdir, ft->fname);
++    if (verbose)
++        TEST_info("testing read of %s", fullname);
++    in = BIO_new_file(fullname, "r");
++    if (in == NULL) {
++        TEST_info("BIO_new_file failed for %s", ft->fname);
++        goto end;
++    }
++    if (!TEST_int_eq(OSSL_ECHSTORE_read_pem(es, in, OSSL_ECH_NO_RETRY),
++                     ft->read)) {
++        TEST_info("OSSL_ECHSTORE_read_pem unexpected fail");
++        goto end;
++    }
++    rv = 1;
++end:
++    OPENSSL_free(fullname);
++    OSSL_ECHSTORE_free(es);
++    BIO_free_all(in);
++    return rv;
++}
++
+ #endif
+ 
+ int setup_tests(void)
+@@ -52,7 +1050,13 @@ int setup_tests(void)
+             return 0;
+         }
+     }
+-    /* TODO(ECH): we'll move test code over later */
++    certsdir = test_get_argument(0);
++    if (certsdir == NULL)
++        certsdir = DEF_CERTS_DIR;
++    ADD_ALL_TESTS(ech_ingest_test, OSSL_NELEM(ingest_tvs));
++    ADD_TEST(ech_store_null_calls);
++    ADD_ALL_TESTS(ech_test_file_read, OSSL_NELEM(fnames));
++    /* TODO(ECH): we'll add more test code once other TODO's settle */
+     return 1;
+ #endif
+     return 1;
+diff --git a/test/recipes/20-test_app_ech.t b/test/recipes/20-test_app_ech.t
+new file mode 100644
+index 0000000000..60a3b96309
+--- /dev/null
++++ b/test/recipes/20-test_app_ech.t
+@@ -0,0 +1,93 @@
++#! /usr/bin/env perl
++# Copyright 2020-2023 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the "License").  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# https://www.openssl.org/source/license.html
++#
++
++use strict;
++use warnings;
++
++use OpenSSL::Test::Utils;
++use OpenSSL::Test qw/:DEFAULT srctop_file srctop_dir bldtop_dir bldtop_file with/;
++
++setup("test_app_ech");
++
++plan skip_all => "ECH tests not supported in this build"
++    if disabled("ech") || disabled("tls1_3")
++       || disabled("ec") || disabled("ecx");
++
++plan tests => 13;
++
++ok(run(app(["openssl", "ech", "-help"])),
++   "Run openssl ech with help");
++ok(run(app(["openssl", "ech",
++                "-ech_version", "13",
++                "-public_name", "example.com",
++                "-out", "eg1.pem",
++                "-verbose",
++                "-text"])),
++   "Generate an ECH key pair for example.com");
++ok(run(app(["openssl", "ech",
++                "-suite", "0x10,2,2",
++                "-public_name", "example.com",
++                "-out", "eg2.pem",
++                "-text"])),
++   "Generate an ECDSA ECH key pair for example.com");
++ok(run(app(["openssl", "ech",
++                "-max_name_len", "13",
++                "-public_name", "example.com",
++                "-out", "eg2.pem",
++                "-text"])),
++   "Generate an ECH key pair for example.com with max name len 13");
++ok(run(app(["openssl", "ech",
++                "-in", "eg1.pem",
++                "-in", "eg2.pem",
++                "-out", "eg3.pem",
++                "-verbose"])),
++   "Catenate the ECH for example.com twice");
++ok(run(app(["openssl", "ech",
++                "-in", "eg3.pem",
++                "-select", "1",
++                "-verbose",
++                "-out", "eg4.pem"])),
++   "Select one ECH Config");
++
++with({ exit_checker => sub { return shift == 1; } },
++    sub { 
++		ok(run(app(["openssl", "ech" ])),
++		   "Run openssl ech with no arg");
++		ok(run(app(["openssl", "ech", "-nohelpatall"])),
++		   "Run openssl ech with unknown arg");
++		ok(run(app(["openssl", "ech", "nohelpatall"])),
++		   "Run openssl ech with unknown non arg");
++		ok(run(app(["openssl", "ech",
++		                "-ech_version", "0xfe09",
++		                "-public_name", "example.com",
++		                "-out", "eg1.pem",
++		                "-text"])),
++		   "Fail to generate an ECH key pair for old draft version");
++		ok(run(app(["openssl", "ech",
++		                "-suite", "not,a,good,one",
++		                "-public_name", "example.com",
++		                "-out", "eg2.pem",
++		                "-text"])),
++		   "Fail to generate an ECH key pair with bad suite");
++		ok(run(app(["openssl", "ech",
++		                "-max_name_len", "1300",
++		                "-public_name", "example.com",
++		                "-text"])),
++		   "(Fail to) Generate an ECH key pair for example.com with max name len 1300");
++		ok(run(app(["openssl", "ech",
++		                "-in", "eg1.pem",
++		                "-in", "eg2.pem",
++		                "-in", "eg3.pem",
++		                "-in", "eg4.pem",
++		                "-in", "eg1.pem",
++		                "-in", "eg2.pem",
++		                "-in", "eg3.pem",
++		                "-in", "eg4.pem"])),
++		   "Too many input files");
++});
+-- 
+2.48.1
+
